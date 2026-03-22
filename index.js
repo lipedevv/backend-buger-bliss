@@ -10,6 +10,7 @@ import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from "@whiskeysockets/baileys";
 import {
+  changeAdminPassword,
   countAdminMemberships,
   createAddress,
   createDriverLocation,
@@ -21,10 +22,13 @@ import {
   ensureAdminMembership,
   findOrCreateUserByPhone,
   getDriverProfileByUser,
+  getAdminAccountForUser,
+  getPromoNotificationSettings,
   getOrderById,
   getSessionUser,
   getWhatsappSessionRow,
   initAppDatabase,
+  loginAdminAccount,
   listAddresses,
   listDriverProfiles,
   listOrdersForDriver,
@@ -33,6 +37,8 @@ import {
   mapDriverProfile,
   serializeWhatsappSession,
   setDefaultAddress,
+  updateOrderRecord,
+  updatePromoNotificationSettings,
   updateDriverProfileRecord,
   updateOrderStatus,
   updateWhatsappSessionRow,
@@ -87,6 +93,16 @@ const syncSessionToDatabase = async (patch = {}) => {
 const clearSocket = () => {
   state.socket = null;
   state.isConnecting = false;
+};
+
+const orderStatusMessageMap = {
+  pending: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi recebido.`,
+  confirmed: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi recebido e esta em preparo!`,
+  preparing: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido esta em preparo!`,
+  dispatched: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido saiu para entrega.`,
+  out_for_delivery: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido esta a caminho.`,
+  delivered: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi entregue. Bom apetite!`,
+  cancelled: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi cancelado. Se precisar, fale com a loja.`,
 };
 
 const ensureSocket = async () => {
@@ -161,7 +177,22 @@ const sendVerificationMessage = async (phone, code) => {
   }
 
   await state.socket.sendMessage(normalizeJid(phone), {
-    text: `Seu codigo ChefBora para confirmar telefone e: ${code}`,
+    text: code,
+  });
+};
+
+const sendOrderStatusMessage = async (order, status) => {
+  if (!state.socket || !order?.customerPhone) {
+    return;
+  }
+
+  const buildMessage = orderStatusMessageMap[status];
+  if (!buildMessage) {
+    return;
+  }
+
+  await state.socket.sendMessage(normalizeJid(order.customerPhone), {
+    text: buildMessage(order),
   });
 };
 
@@ -291,6 +322,41 @@ app.post("/api/auth/logout", authMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/admin-auth/login", (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+    const session = loginAdminAccount(db, email, password);
+    res.json({ ok: true, ...session });
+  } catch (error) {
+    logger.error({ error }, "Falha no login admin");
+    res.status(400).json({ error: error.message || "Falha no login admin." });
+  }
+});
+
+app.get("/api/admin-auth/me", authMiddleware, (req, res) => {
+  const admin = getAdminAccountForUser(db, req.auth.profile.userId);
+  if (!admin) {
+    return res.status(403).json({ error: "Conta admin nao encontrada." });
+  }
+  res.json({ ok: true, admin });
+});
+
+app.post("/api/admin-auth/change-password", authMiddleware, (req, res) => {
+  try {
+    const admin = changeAdminPassword(
+      db,
+      req.auth.profile.userId,
+      String(req.body.currentPassword || ""),
+      String(req.body.nextPassword || ""),
+    );
+    res.json({ ok: true, admin });
+  } catch (error) {
+    logger.error({ error }, "Falha ao trocar senha admin");
+    res.status(400).json({ error: error.message || "Falha ao trocar senha admin." });
+  }
+});
+
 app.post("/api/admin/bootstrap", authMiddleware, (req, res) => {
   if (countAdminMemberships(db) > 0) {
     return res.status(409).json({ error: "O restaurante ja possui admin." });
@@ -343,7 +409,11 @@ app.post("/api/orders", authMiddleware, (req, res) => {
     userId: req.auth.profile.userId,
     restaurantId: RESTAURANT_ID,
   });
-  res.json({ ok: true, order: getOrderById(db, orderId) });
+  const order = getOrderById(db, orderId);
+  sendOrderStatusMessage(order, "pending").catch((error) => {
+    logger.warn({ error, orderId }, "Falha ao enviar status inicial no WhatsApp");
+  });
+  res.json({ ok: true, order });
 });
 
 app.patch("/api/orders/:id/status", authMiddleware, (req, res) => {
@@ -364,6 +434,28 @@ app.patch("/api/orders/:id/status", authMiddleware, (req, res) => {
     role: isAdmin ? "admin" : "driver",
     note: req.body.note || "",
   });
+  const updatedOrder = getOrderById(db, order.id);
+  sendOrderStatusMessage(updatedOrder, req.body.status).catch((error) => {
+    logger.warn({ error, orderId: order.id, status: req.body.status }, "Falha ao enviar status no WhatsApp");
+  });
+  res.json({ ok: true, order: updatedOrder });
+});
+
+app.patch("/api/admin/orders/:id", authMiddleware, requireAdmin, (req, res) => {
+  const order = getOrderById(db, req.params.id);
+  if (!order) {
+    return res.status(404).json({ error: "Pedido nao encontrado." });
+  }
+
+  updateOrderRecord(db, order.id, {
+    customerName: req.body.customerName,
+    customerPhone: req.body.customerPhone,
+    addressLabel: req.body.addressLabel,
+    addressFull: req.body.addressFull,
+    notesInternal: req.body.notesInternal,
+    assignedDriverId: req.body.assignedDriverId,
+  });
+
   res.json({ ok: true, order: getOrderById(db, order.id) });
 });
 
@@ -375,8 +467,18 @@ app.get("/api/admin/dashboard", authMiddleware, requireAdmin, (_req, res) => {
       recentOrders: listOrdersForRestaurant(db, RESTAURANT_ID),
       drivers: listDriverProfiles(db),
       whatsappSession: serializeWhatsappSession(getWhatsappSessionRow(db)),
+      promoNotificationSettings: getPromoNotificationSettings(db),
     },
   });
+});
+
+app.get("/api/admin/promo-settings", authMiddleware, requireAdmin, (_req, res) => {
+  res.json({ ok: true, settings: getPromoNotificationSettings(db) });
+});
+
+app.put("/api/admin/promo-settings", authMiddleware, requireAdmin, (req, res) => {
+  const settings = updatePromoNotificationSettings(db, req.body || {});
+  res.json({ ok: true, settings });
 });
 
 app.post("/api/driver/profile", authMiddleware, (req, res) => {

@@ -1,12 +1,23 @@
 import crypto from "node:crypto";
 
 const DEFAULT_RESTAURANT_ID = "11111111-1111-4111-8111-111111111111";
+const DEFAULT_ADMIN_USER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const DEFAULT_ADMIN_ACCOUNT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const DEFAULT_ADMIN_PHONE = "5500000000000";
+const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL || "smashadmin@smash.com";
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "admin123";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
 
 const nowIso = () => new Date().toISOString();
 const hashValue = (value) => crypto.createHash("sha256").update(value).digest("hex");
 const createId = () => crypto.randomUUID();
 const createToken = () => crypto.randomBytes(48).toString("hex");
+const createPasswordSalt = () => crypto.randomBytes(16).toString("hex");
+const hashPassword = (password, salt) => crypto.scryptSync(password, salt, 64).toString("hex");
+const verifyPassword = (password, salt, expectedHash) => {
+  const calculatedHash = hashPassword(password, salt);
+  return crypto.timingSafeEqual(Buffer.from(calculatedHash, "hex"), Buffer.from(expectedHash, "hex"));
+};
 
 export const initAppDatabase = (db) => {
   db.exec(`
@@ -161,6 +172,30 @@ export const initAppDatabase = (db) => {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS admin_accounts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE,
+      password_salt TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      must_change_password INTEGER NOT NULL DEFAULT 1,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      failed_attempts INTEGER NOT NULL DEFAULT 0,
+      locked_until TEXT,
+      last_login_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS promo_notification_settings (
+      restaurant_id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 0,
+      title TEXT NOT NULL DEFAULT '',
+      body TEXT NOT NULL DEFAULT '',
+      target_path TEXT NOT NULL DEFAULT '/promos',
+      updated_at TEXT NOT NULL
+    );
   `);
 
   const hasWhatsappSession = db.prepare("SELECT id FROM whatsapp_sessions WHERE restaurant_id = ?").get(DEFAULT_RESTAURANT_ID);
@@ -170,6 +205,55 @@ export const initAppDatabase = (db) => {
         id, restaurant_id, status, created_at, updated_at
       ) VALUES (?, ?, 'disconnected', ?, ?)
     `).run(createId(), DEFAULT_RESTAURANT_ID, nowIso(), nowIso());
+  }
+
+  const adminUser = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(DEFAULT_ADMIN_USER_ID);
+  if (!adminUser) {
+    db.prepare(`
+      INSERT INTO users (id, phone, name, phone_verified_at, preferred_role, created_at, updated_at)
+      VALUES (?, ?, 'Smash Admin', ?, 'admin', ?, ?)
+    `).run(DEFAULT_ADMIN_USER_ID, DEFAULT_ADMIN_PHONE, nowIso(), nowIso(), nowIso());
+  }
+
+  const adminMembership = db.prepare(`
+    SELECT id
+    FROM memberships
+    WHERE restaurant_id = ?
+      AND user_id = ?
+    LIMIT 1
+  `).get(DEFAULT_RESTAURANT_ID, DEFAULT_ADMIN_USER_ID);
+
+  if (!adminMembership) {
+    db.prepare(`
+      INSERT INTO memberships (id, restaurant_id, user_id, role, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, 'admin', 1, ?, ?)
+    `).run(createId(), DEFAULT_RESTAURANT_ID, DEFAULT_ADMIN_USER_ID, nowIso(), nowIso());
+  }
+
+  const adminAccount = db.prepare("SELECT id FROM admin_accounts WHERE id = ? LIMIT 1").get(DEFAULT_ADMIN_ACCOUNT_ID);
+  if (!adminAccount) {
+    const salt = createPasswordSalt();
+    db.prepare(`
+      INSERT INTO admin_accounts (
+        id, user_id, email, password_salt, password_hash, must_change_password, is_active, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+    `).run(
+      DEFAULT_ADMIN_ACCOUNT_ID,
+      DEFAULT_ADMIN_USER_ID,
+      DEFAULT_ADMIN_EMAIL,
+      salt,
+      hashPassword(DEFAULT_ADMIN_PASSWORD, salt),
+      nowIso(),
+      nowIso(),
+    );
+  }
+
+  const promoSettings = db.prepare("SELECT restaurant_id FROM promo_notification_settings WHERE restaurant_id = ? LIMIT 1").get(DEFAULT_RESTAURANT_ID);
+  if (!promoSettings) {
+    db.prepare(`
+      INSERT INTO promo_notification_settings (restaurant_id, enabled, title, body, target_path, updated_at)
+      VALUES (?, 0, 'Promocao nova no app', 'Tem desconto novo te esperando.', '/promos', ?)
+    `).run(DEFAULT_RESTAURANT_ID, nowIso());
   }
 };
 
@@ -517,6 +601,28 @@ export const updateOrderStatus = (db, orderId, status, actor) => {
   `).run(createId(), orderId, status, actor.note || "", actor.userId || null, actor.role || "system", nowIso());
 };
 
+export const updateOrderRecord = (db, orderId, patch) => {
+  db.prepare(`
+    UPDATE orders
+    SET
+      customer_name = COALESCE(?, customer_name),
+      customer_phone = COALESCE(?, customer_phone),
+      address_label = COALESCE(?, address_label),
+      address_full = COALESCE(?, address_full),
+      notes_internal = COALESCE(?, notes_internal),
+      assigned_driver_id = COALESCE(?, assigned_driver_id)
+    WHERE id = ?
+  `).run(
+    patch.customerName ?? null,
+    patch.customerPhone ?? null,
+    patch.addressLabel ?? null,
+    patch.addressFull ?? null,
+    patch.notesInternal ?? null,
+    patch.assignedDriverId ?? null,
+    orderId,
+  );
+};
+
 export const countAdminMemberships = (db) => {
   const row = db.prepare(`
     SELECT COUNT(*) AS total
@@ -714,3 +820,138 @@ export const serializeWhatsappSession = (row) => ({
   errorMessage: row.error_message || "",
   lastConnectedAt: row.last_connected_at || null,
 });
+
+export const loginAdminAccount = (db, email, password) => {
+  const account = db.prepare(`
+    SELECT *
+    FROM admin_accounts
+    WHERE lower(email) = lower(?)
+      AND is_active = 1
+    LIMIT 1
+  `).get(email);
+
+  if (!account) {
+    throw new Error("Credenciais invalidas.");
+  }
+
+  if (account.locked_until && new Date(account.locked_until).getTime() > Date.now()) {
+    throw new Error("Login temporariamente bloqueado. Tente novamente em alguns minutos.");
+  }
+
+  if (!verifyPassword(password, account.password_salt, account.password_hash)) {
+    const failedAttempts = (account.failed_attempts || 0) + 1;
+    const lockedUntil = failedAttempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000).toISOString() : null;
+    db.prepare(`
+      UPDATE admin_accounts
+      SET failed_attempts = ?, locked_until = ?, updated_at = ?
+      WHERE id = ?
+    `).run(failedAttempts, lockedUntil, nowIso(), account.id);
+    throw new Error("Credenciais invalidas.");
+  }
+
+  db.prepare(`
+    UPDATE admin_accounts
+    SET failed_attempts = 0, locked_until = NULL, last_login_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(nowIso(), nowIso(), account.id);
+
+  const token = createUserSession(db, account.user_id);
+  const session = getSessionUser(db, token);
+  return {
+    token,
+    profile: session.profile,
+    admin: {
+      email: account.email,
+      mustChangePassword: Boolean(account.must_change_password),
+      lastLoginAt: account.last_login_at || null,
+    },
+  };
+};
+
+export const getAdminAccountForUser = (db, userId) => {
+  const account = db.prepare(`
+    SELECT *
+    FROM admin_accounts
+    WHERE user_id = ?
+      AND is_active = 1
+    LIMIT 1
+  `).get(userId);
+
+  if (!account) return null;
+
+  return {
+    email: account.email,
+    mustChangePassword: Boolean(account.must_change_password),
+    lastLoginAt: account.last_login_at || null,
+  };
+};
+
+export const changeAdminPassword = (db, userId, currentPassword, nextPassword) => {
+  const account = db.prepare(`
+    SELECT *
+    FROM admin_accounts
+    WHERE user_id = ?
+      AND is_active = 1
+    LIMIT 1
+  `).get(userId);
+
+  if (!account) {
+    throw new Error("Conta admin nao encontrada.");
+  }
+
+  if (!verifyPassword(currentPassword, account.password_salt, account.password_hash)) {
+    throw new Error("Senha atual invalida.");
+  }
+
+  if (typeof nextPassword !== "string" || nextPassword.length < 10 || !/[A-Za-z]/.test(nextPassword) || !/\d/.test(nextPassword)) {
+    throw new Error("A nova senha precisa ter pelo menos 10 caracteres, com letras e numeros.");
+  }
+
+  const nextSalt = createPasswordSalt();
+  db.prepare(`
+    UPDATE admin_accounts
+    SET password_salt = ?, password_hash = ?, must_change_password = 0, updated_at = ?
+    WHERE id = ?
+  `).run(nextSalt, hashPassword(nextPassword, nextSalt), nowIso(), account.id);
+
+  return getAdminAccountForUser(db, userId);
+};
+
+export const getPromoNotificationSettings = (db) => {
+  const row = db.prepare(`
+    SELECT *
+    FROM promo_notification_settings
+    WHERE restaurant_id = ?
+    LIMIT 1
+  `).get(DEFAULT_RESTAURANT_ID);
+
+  return row ? {
+    enabled: Boolean(row.enabled),
+    title: row.title,
+    body: row.body,
+    targetPath: row.target_path,
+    updatedAt: row.updated_at,
+  } : null;
+};
+
+export const updatePromoNotificationSettings = (db, patch) => {
+  db.prepare(`
+    UPDATE promo_notification_settings
+    SET
+      enabled = COALESCE(?, enabled),
+      title = COALESCE(?, title),
+      body = COALESCE(?, body),
+      target_path = COALESCE(?, target_path),
+      updated_at = ?
+    WHERE restaurant_id = ?
+  `).run(
+    patch.enabled == null ? null : (patch.enabled ? 1 : 0),
+    patch.title ?? null,
+    patch.body ?? null,
+    patch.targetPath ?? null,
+    nowIso(),
+    DEFAULT_RESTAURANT_ID,
+  );
+
+  return getPromoNotificationSettings(db);
+};
