@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import multer from "multer";
 import pino from "pino";
 import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
@@ -68,13 +69,18 @@ const PORT = Number(process.env.PORT || 4010);
 const RESTAURANT_ID = process.env.WHATSAPP_RESTAURANT_ID || "11111111-1111-4111-8111-111111111111";
 const AUTH_DIR = process.env.BAILEYS_AUTH_DIR || path.join(__dirname, ".baileys-auth");
 const SQLITE_PATH = process.env.SQLITE_PATH || path.join(__dirname, "data", "catalog.sqlite");
+const UPLOADS_DIR = process.env.UPLOADS_DIR || path.join(__dirname, "data", "uploads");
+const MAX_UPLOAD_SIZE_BYTES = Number(process.env.MAX_UPLOAD_SIZE_BYTES || 8 * 1024 * 1024);
 
 fs.mkdirSync(AUTH_DIR, { recursive: true });
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 const db = initCatalogDatabase(SQLITE_PATH);
 initAppDatabase(db);
 
 const app = express();
+app.set("trust proxy", true);
 app.use(cors());
+app.use("/uploads", express.static(UPLOADS_DIR));
 app.use(express.json());
 
 const state = {
@@ -85,6 +91,52 @@ const state = {
 const normalizePhone = (value = "") => value.replace(/\D/g, "");
 const normalizeJid = (phone) => `${normalizePhone(phone)}@s.whatsapp.net`;
 const createCode = () => String(Math.floor(100000 + Math.random() * 900000));
+const getPublicBaseUrl = (req) => (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/$/, "");
+const buildAbsoluteAssetUrl = (req, value) => {
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  return `${getPublicBaseUrl(req)}${value.startsWith("/") ? value : `/${value}`}`;
+};
+const resolveCatalogSnapshotUrls = (req, snapshot) => ({
+  ...snapshot,
+  restaurant: {
+    ...snapshot.restaurant,
+    logoUrl: buildAbsoluteAssetUrl(req, snapshot.restaurant.logoUrl),
+    heroImageUrl: buildAbsoluteAssetUrl(req, snapshot.restaurant.heroImageUrl),
+  },
+  banners: snapshot.banners.map((banner) => ({
+    ...banner,
+    imageUrl: buildAbsoluteAssetUrl(req, banner.imageUrl),
+  })),
+  products: snapshot.products.map((product) => ({
+    ...product,
+    image: buildAbsoluteAssetUrl(req, product.image),
+  })),
+});
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, callback) => {
+      callback(null, UPLOADS_DIR);
+    },
+    filename: (req, file, callback) => {
+      const safeKind = String(req.body.kind || "image").toLowerCase().replace(/[^a-z0-9-]/g, "-") || "image";
+      const parsedExt = path.extname(file.originalname || "").toLowerCase();
+      const ext = parsedExt && parsedExt.length <= 8 ? parsedExt : ".jpg";
+      callback(null, `${safeKind}-${Date.now()}-${crypto.randomUUID()}${ext}`);
+    },
+  }),
+  limits: {
+    fileSize: MAX_UPLOAD_SIZE_BYTES,
+  },
+  fileFilter: (_req, file, callback) => {
+    if (!file.mimetype?.startsWith("image/")) {
+      callback(new Error("Envie apenas arquivos de imagem."));
+      return;
+    }
+    callback(null, true);
+  },
+});
 
 const syncSessionToDatabase = async (patch = {}) => {
   updateWhatsappSessionRow(db, patch);
@@ -96,7 +148,7 @@ const clearSocket = () => {
 };
 
 const orderStatusMessageMap = {
-  pending: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi recebido.`,
+  pending: (order) => `Olá, ${order.customerName || "cliente"}, seu pedido foi recebido.`,
   confirmed: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi recebido e esta em preparo!`,
   preparing: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido esta em preparo!`,
   dispatched: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido saiu para entrega.`,
@@ -227,7 +279,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/api/catalog/snapshot", (_req, res) => {
-  res.json({ ok: true, snapshot: getCatalogSnapshot(db) });
+  res.json({ ok: true, snapshot: resolveCatalogSnapshotUrls(_req, getCatalogSnapshot(db)) });
 });
 
 app.put("/api/catalog/restaurant", authMiddleware, requireAdmin, (req, res) => {
@@ -459,11 +511,37 @@ app.patch("/api/admin/orders/:id", authMiddleware, requireAdmin, (req, res) => {
   res.json({ ok: true, order: getOrderById(db, order.id) });
 });
 
+app.post("/api/admin/assets", authMiddleware, requireAdmin, (req, res) => {
+  upload.single("file")(req, res, (error) => {
+    if (error) {
+      logger.error({ error }, "Falha no upload de imagem");
+      res.status(400).json({ error: error.message || "Falha ao enviar imagem." });
+      return;
+    }
+
+    if (!req.file) {
+      res.status(400).json({ error: "Nenhuma imagem enviada." });
+      return;
+    }
+
+    const assetPath = `/uploads/${req.file.filename}`;
+    res.json({
+      ok: true,
+      assetPath,
+      assetUrl: buildAbsoluteAssetUrl(req, assetPath),
+      originalName: req.file.originalname,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+    });
+  });
+});
+
 app.get("/api/admin/dashboard", authMiddleware, requireAdmin, (_req, res) => {
+  const snapshot = resolveCatalogSnapshotUrls(_req, getCatalogSnapshot(db));
   res.json({
     ok: true,
     dashboard: {
-      ...getCatalogSnapshot(db),
+      ...snapshot,
       recentOrders: listOrdersForRestaurant(db, RESTAURANT_ID),
       drivers: listDriverProfiles(db),
       whatsappSession: serializeWhatsappSession(getWhatsappSessionRow(db)),
