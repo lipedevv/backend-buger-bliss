@@ -11,6 +11,7 @@ import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from "@whiskeysockets/baileys";
 import {
+  buildAdminDashboardOverview,
   changeAdminPassword,
   countAdminMemberships,
   createAddress,
@@ -35,11 +36,13 @@ import {
   listOrdersForDriver,
   listOrdersForRestaurant,
   listOrdersForUser,
+  listWhatsappMessageTemplates,
   mapDriverProfile,
   serializeWhatsappSession,
   setDefaultAddress,
   updateOrderRecord,
   updatePromoNotificationSettings,
+  updateWhatsappMessageTemplates,
   updateDriverProfileRecord,
   updateOrderStatus,
   updateWhatsappSessionRow,
@@ -178,16 +181,60 @@ const clearSocket = () => {
   state.socket = null;
   state.isConnecting = false;
 };
-
-const orderStatusMessageMap = {
-  pending: (order) => `Olá, ${order.customerName || "cliente"}, seu pedido foi recebido.`,
-  confirmed: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi recebido e esta em preparo!`,
-  preparing: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido esta em preparo!`,
-  dispatched: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido saiu para entrega.`,
-  out_for_delivery: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido esta a caminho.`,
-  delivered: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi entregue. Bom apetite!`,
-  cancelled: (order) => `Ola, ${order.customerName || "cliente"}, seu pedido foi cancelado. Se precisar, fale com a loja.`,
+const currency = (value) => `R$ ${Number(value || 0).toFixed(2).replace(".", ",")}`;
+const orderCode = (order) => order?.id ? order.id.slice(0, 6).toLowerCase() : "pedido";
+const paymentEmoji = (paymentMethod = "") => {
+  const normalized = String(paymentMethod).toLowerCase();
+  if (normalized.includes("pix")) return "💸";
+  if (normalized.includes("card") || normalized.includes("cart")) return "💳";
+  if (normalized.includes("cash") || normalized.includes("dinheiro")) return "💵";
+  return "🧾";
 };
+const friendlyPaymentMethod = (paymentMethod = "") => {
+  const normalized = String(paymentMethod).toLowerCase();
+  if (normalized.includes("pix")) return "Pix";
+  if (normalized.includes("card") || normalized.includes("cart")) return "Cartão - Máquina Móvel";
+  if (normalized.includes("cash") || normalized.includes("dinheiro")) return "Dinheiro";
+  return paymentMethod || "Nao informado";
+};
+const friendlyDeliveryLabel = (order) => order?.deliveryMode === "delivery" ? "*Entrega*" : "*Retirada na Loja*";
+const addressBlock = (order) => {
+  if (order?.deliveryMode === "delivery") {
+    return `Endereco de Entrega: *${order?.addressFull || "Nao informado"}*`;
+  }
+  return `Endereco para Retirada: *${order?.addressFull || "Nao informado"}*`;
+};
+const formatOrderItemsBlock = (order) => (order?.items || []).map((item) => {
+  const options = (item.optionSnapshot || []).map((option) => {
+    const prefix = option.groupName ? `_🔸${option.groupName}:_\n` : "";
+    return `${prefix}*▪️ ${option.name}*`;
+  }).join("\n");
+  return [
+    `➡️ ${item.quantity} x *${item.productName}*`,
+    options,
+    "",
+  ].filter(Boolean).join("\n");
+}).join("\n");
+const buildObsBlock = (order) => order?.obs ? `*OBS: ${order.obs}*` : "";
+const buildDeliveryFeeBlock = (order) => Number(order?.deliveryFee || 0) > 0 ? `+ Taxa de entrega: *${currency(order.deliveryFee)}*` : "";
+const buildTemplateVariables = (order) => ({
+  customer_name: order?.customerName || "cliente",
+  order_code: orderCode(order),
+  payment_method: friendlyPaymentMethod(order?.paymentMethod),
+  payment_emoji: paymentEmoji(order?.paymentMethod),
+  items_total: currency(order?.subtotal || 0),
+  delivery_fee_block: buildDeliveryFeeBlock(order),
+  total: currency(order?.total || 0),
+  delivery_mode_label: friendlyDeliveryLabel(order),
+  address_block: addressBlock(order),
+  items_block: formatOrderItemsBlock(order),
+  obs_block: buildObsBlock(order),
+});
+const renderTemplate = (body, variables) => Object.entries(variables).reduce(
+  (content, [key, value]) => content.replaceAll(`{{${key}}}`, String(value ?? "")),
+  body,
+).replace(/\n{3,}/g, "\n\n").trim();
+const getTemplateBody = (key) => listWhatsappMessageTemplates(db).find((template) => template.key === key)?.body || "";
 
 const ensureSocket = async () => {
   if (state.socket || state.isConnecting) return state.socket;
@@ -270,13 +317,14 @@ const sendOrderStatusMessage = async (order, status) => {
     return;
   }
 
-  const buildMessage = orderStatusMessageMap[status];
-  if (!buildMessage) {
+  const templateKey = status === "pending" ? "order_summary" : status;
+  const templateBody = getTemplateBody(templateKey);
+  if (!templateBody) {
     return;
   }
 
   await state.socket.sendMessage(normalizeJid(order.customerPhone), {
-    text: buildMessage(order),
+    text: renderTemplate(templateBody, buildTemplateVariables(order)),
   });
 };
 
@@ -584,9 +632,11 @@ app.get("/api/admin/dashboard", authMiddleware, requireAdmin, (_req, res) => {
     dashboard: {
       ...snapshot,
       recentOrders: listOrdersForRestaurant(db, RESTAURANT_ID),
+      overview: buildAdminDashboardOverview(db, RESTAURANT_ID),
       drivers: listDriverProfiles(db),
       whatsappSession: serializeWhatsappSession(getWhatsappSessionRow(db)),
       promoNotificationSettings: getPromoNotificationSettings(db),
+      whatsappTemplates: listWhatsappMessageTemplates(db),
     },
   });
 });
@@ -598,6 +648,11 @@ app.get("/api/admin/promo-settings", authMiddleware, requireAdmin, (_req, res) =
 app.put("/api/admin/promo-settings", authMiddleware, requireAdmin, (req, res) => {
   const settings = updatePromoNotificationSettings(db, req.body || {});
   res.json({ ok: true, settings });
+});
+
+app.put("/api/admin/whatsapp-templates", authMiddleware, requireAdmin, (req, res) => {
+  const templates = updateWhatsappMessageTemplates(db, req.body?.templates || []);
+  res.json({ ok: true, templates });
 });
 
 app.post("/api/driver/profile", authMiddleware, (req, res) => {

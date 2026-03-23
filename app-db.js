@@ -7,6 +7,59 @@ const DEFAULT_ADMIN_PHONE = "5500000000000";
 const DEFAULT_ADMIN_EMAIL = process.env.DEFAULT_ADMIN_EMAIL || "smashadmin@smash.com";
 const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "admin123";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30;
+const DEFAULT_WHATSAPP_TEMPLATES = [
+  {
+    key: "order_summary",
+    label: "Resumo do pedido",
+    body: [
+      "Agradecemos *{{customer_name}}*, confirmamos o seu pedido *{{order_code}}*. Vou te atualizando sobre o seu pedido por aqui 😉",
+      "",
+      "====== Pedido nº *{{order_code}}* ======",
+      "",
+      "{{items_block}}",
+      "{{obs_block}}",
+      "",
+      "Forma de Pagamento: *{{payment_method}}* {{payment_emoji}}",
+      "",
+      "Valor itens: *{{items_total}}*",
+      "{{delivery_fee_block}}",
+      "= Valor Total: *{{total}}*",
+      "",
+      "{{delivery_mode_label}}",
+      "{{address_block}}",
+    ].join("\n"),
+  },
+  {
+    key: "pending",
+    label: "Pedido recebido",
+    body: "Ola, {{customer_name}}, seu pedido *{{order_code}}* foi recebido e estamos organizando tudo por aqui.",
+  },
+  {
+    key: "confirmed",
+    label: "Pedido confirmado",
+    body: "Ola, {{customer_name}}, confirmamos o pedido *{{order_code}}* e ele ja entrou em preparo!",
+  },
+  {
+    key: "preparing",
+    label: "Pedido em preparo",
+    body: "Ola, {{customer_name}}, seu pedido *{{order_code}}* esta em preparo neste momento.",
+  },
+  {
+    key: "out_for_delivery",
+    label: "Saiu para entrega",
+    body: "Ola, {{customer_name}}, seu pedido *{{order_code}}* saiu para entrega e ja esta a caminho.",
+  },
+  {
+    key: "delivered",
+    label: "Pedido entregue",
+    body: "Ola, {{customer_name}}, seu pedido *{{order_code}}* foi entregue. Bom apetite!",
+  },
+  {
+    key: "cancelled",
+    label: "Pedido cancelado",
+    body: "Ola, {{customer_name}}, seu pedido *{{order_code}}* foi cancelado. Se precisar, fale com a loja.",
+  },
+];
 
 const nowIso = () => new Date().toISOString();
 const hashValue = (value) => crypto.createHash("sha256").update(value).digest("hex");
@@ -207,6 +260,13 @@ export const initAppDatabase = (db) => {
       target_path TEXT NOT NULL DEFAULT '/promos',
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_message_templates (
+      key TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL
+    );
   `);
 
   ensureColumn(db, "users", "loyalty_points_balance", "REAL NOT NULL DEFAULT 0");
@@ -271,6 +331,16 @@ export const initAppDatabase = (db) => {
       VALUES (?, 0, 'Promocao nova no app', 'Tem desconto novo te esperando.', '/promos', ?)
     `).run(DEFAULT_RESTAURANT_ID, nowIso());
   }
+
+  DEFAULT_WHATSAPP_TEMPLATES.forEach((template) => {
+    const existingTemplate = db.prepare("SELECT key FROM whatsapp_message_templates WHERE key = ? LIMIT 1").get(template.key);
+    if (!existingTemplate) {
+      db.prepare(`
+        INSERT INTO whatsapp_message_templates (key, label, body, updated_at)
+        VALUES (?, ?, ?, ?)
+      `).run(template.key, template.label, template.body, nowIso());
+    }
+  });
 };
 
 const getMembershipRows = (db, userId) => db.prepare(`
@@ -1008,4 +1078,142 @@ export const updatePromoNotificationSettings = (db, patch) => {
   );
 
   return getPromoNotificationSettings(db);
+};
+
+export const listWhatsappMessageTemplates = (db) => db.prepare(`
+  SELECT *
+  FROM whatsapp_message_templates
+  ORDER BY key
+`).all().map((row) => ({
+  key: row.key,
+  label: row.label,
+  body: row.body,
+  updatedAt: row.updated_at,
+}));
+
+export const updateWhatsappMessageTemplates = (db, templates) => {
+  const upsert = db.prepare(`
+    INSERT INTO whatsapp_message_templates (key, label, body, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      label = excluded.label,
+      body = excluded.body,
+      updated_at = excluded.updated_at
+  `);
+  const timestamp = nowIso();
+  const transaction = db.transaction((rows) => {
+    rows.forEach((template) => {
+      upsert.run(
+        template.key,
+        template.label || DEFAULT_WHATSAPP_TEMPLATES.find((item) => item.key === template.key)?.label || template.key,
+        template.body || "",
+        timestamp,
+      );
+    });
+  });
+  transaction(templates || []);
+  return listWhatsappMessageTemplates(db);
+};
+
+export const buildAdminDashboardOverview = (db, restaurantId = DEFAULT_RESTAURANT_ID) => {
+  const orders = db.prepare(`
+    SELECT *
+    FROM orders
+    WHERE restaurant_id = ?
+    ORDER BY created_at DESC
+  `).all(restaurantId);
+  const users = db.prepare(`
+    SELECT *
+    FROM users
+    ORDER BY created_at DESC
+  `).all();
+
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ((now.getDay() + 6) % 7)).getTime();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  const completedOrders = orders.filter((order) => !["cancelled"].includes(order.status));
+  const deliveredOrders = completedOrders.filter((order) => order.status === "delivered");
+
+  const revenueByRange = (rangeStart) => deliveredOrders
+    .filter((order) => new Date(order.created_at).getTime() >= rangeStart)
+    .reduce((sum, order) => sum + Number(order.total || 0), 0);
+
+  const topProductsMap = new Map();
+  db.prepare(`
+    SELECT oi.product_name AS product_name, SUM(oi.quantity) AS quantity, SUM(oi.item_total) AS revenue
+    FROM order_items oi
+    JOIN orders o ON o.id = oi.order_id
+    WHERE o.restaurant_id = ?
+      AND o.status != 'cancelled'
+    GROUP BY oi.product_name
+    ORDER BY quantity DESC, revenue DESC
+    LIMIT 5
+  `).all(restaurantId).forEach((row) => {
+    topProductsMap.set(row.product_name, {
+      productName: row.product_name,
+      quantity: Number(row.quantity || 0),
+      revenue: Number(row.revenue || 0),
+    });
+  });
+
+  const timeline = Array.from({ length: 7 }).map((_, offset) => {
+    const date = new Date(now);
+    date.setDate(now.getDate() - (6 - offset));
+    const dayKey = date.toISOString().slice(0, 10);
+    const dayOrders = deliveredOrders.filter((order) => order.created_at.slice(0, 10) === dayKey);
+    return {
+      label: date.toLocaleDateString("pt-BR", { weekday: "short" }),
+      total: dayOrders.reduce((sum, order) => sum + Number(order.total || 0), 0),
+      orderCount: dayOrders.length,
+    };
+  });
+
+  const alerts = [];
+  const lateOrders = orders.filter((order) => ["pending", "confirmed", "preparing"].includes(order.status)
+    && (Date.now() - new Date(order.created_at).getTime()) > 35 * 60 * 1000);
+  if (lateOrders.length > 0) {
+    alerts.push({
+      id: "late-orders",
+      level: "warning",
+      title: "Pedido atrasado",
+      description: `${lateOrders.length} pedido(s) estao aguardando atencao ha mais de 35 minutos.`,
+    });
+  }
+  const pendingPayments = orders.filter((order) => String(order.payment_method || "").toLowerCase().includes("pendente"));
+  if (pendingPayments.length > 0) {
+    alerts.push({
+      id: "payment-pending",
+      level: "danger",
+      title: "Pagamento pendente",
+      description: `${pendingPayments.length} pedido(s) com pagamento pendente precisam de revisao.`,
+    });
+  }
+  if (alerts.length === 0) {
+    alerts.push({
+      id: "all-good",
+      level: "info",
+      title: "Operacao normal",
+      description: "Sem alertas criticos no momento.",
+    });
+  }
+
+  return {
+    revenueToday: revenueByRange(startOfDay),
+    revenueWeek: revenueByRange(startOfWeek),
+    revenueMonth: revenueByRange(startOfMonth),
+    averageTicket: deliveredOrders.length
+      ? deliveredOrders.reduce((sum, order) => sum + Number(order.total || 0), 0) / deliveredOrders.length
+      : 0,
+    totalSales: deliveredOrders.reduce((sum, order) => sum + Number(order.total || 0), 0),
+    newCustomers: users.filter((user) => new Date(user.created_at).getTime() >= startOfMonth).length,
+    pendingOrders: orders.filter((order) => order.status === "pending").length,
+    preparingOrders: orders.filter((order) => ["confirmed", "preparing"].includes(order.status)).length,
+    deliveringOrders: orders.filter((order) => ["dispatched", "out_for_delivery"].includes(order.status)).length,
+    finishedOrders: orders.filter((order) => order.status === "delivered").length,
+    cancelledOrders: orders.filter((order) => order.status === "cancelled").length,
+    salesTimeline: timeline,
+    topProducts: Array.from(topProductsMap.values()),
+    alerts,
+  };
 };
