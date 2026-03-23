@@ -664,6 +664,10 @@ app.get("/api/admin/promo-settings", authMiddleware, requireAdmin, (_req, res) =
   res.json({ ok: true, settings: getPromoNotificationSettings(db) });
 });
 
+app.get("/api/admin/whatsapp-templates", authMiddleware, requireAdmin, (_req, res) => {
+  res.json({ ok: true, templates: listWhatsappMessageTemplates(db) });
+});
+
 app.put("/api/admin/promo-settings", authMiddleware, requireAdmin, (req, res) => {
   const settings = updatePromoNotificationSettings(db, req.body || {});
   res.json({ ok: true, settings });
