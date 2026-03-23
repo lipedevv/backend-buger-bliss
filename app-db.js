@@ -18,6 +18,13 @@ const verifyPassword = (password, salt, expectedHash) => {
   const calculatedHash = hashPassword(password, salt);
   return crypto.timingSafeEqual(Buffer.from(calculatedHash, "hex"), Buffer.from(expectedHash, "hex"));
 };
+const hasColumn = (db, tableName, columnName) => db.prepare(`PRAGMA table_info(${tableName})`).all()
+  .some((column) => column.name === columnName);
+const ensureColumn = (db, tableName, columnName, definition) => {
+  if (!hasColumn(db, tableName, columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+};
 
 export const initAppDatabase = (db) => {
   db.exec(`
@@ -28,6 +35,7 @@ export const initAppDatabase = (db) => {
       avatar_url TEXT NOT NULL DEFAULT '',
       phone_verified_at TEXT,
       preferred_role TEXT NOT NULL DEFAULT 'customer',
+      loyalty_points_balance REAL NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -79,6 +87,9 @@ export const initAppDatabase = (db) => {
       discount REAL NOT NULL DEFAULT 0,
       delivery_fee REAL NOT NULL DEFAULT 0,
       total REAL NOT NULL DEFAULT 0,
+      loyalty_points_redeemed REAL NOT NULL DEFAULT 0,
+      loyalty_discount REAL NOT NULL DEFAULT 0,
+      loyalty_points_earned REAL NOT NULL DEFAULT 0,
       obs TEXT,
       notes_internal TEXT,
       assigned_driver_id TEXT,
@@ -198,6 +209,11 @@ export const initAppDatabase = (db) => {
     );
   `);
 
+  ensureColumn(db, "users", "loyalty_points_balance", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "orders", "loyalty_points_redeemed", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "orders", "loyalty_discount", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "orders", "loyalty_points_earned", "REAL NOT NULL DEFAULT 0");
+
   const hasWhatsappSession = db.prepare("SELECT id FROM whatsapp_sessions WHERE restaurant_id = ?").get(DEFAULT_RESTAURANT_ID);
   if (!hasWhatsappSession) {
     db.prepare(`
@@ -272,6 +288,7 @@ const mapProfile = (db, userRow) => ({
   avatarUrl: userRow.avatar_url || "",
   phoneVerifiedAt: userRow.phone_verified_at || null,
   preferredRole: userRow.preferred_role || "customer",
+  loyaltyPointsBalance: Number(userRow.loyalty_points_balance || 0),
   memberships: getMembershipRows(db, userRow.id).map((membership) => ({
     id: membership.id,
     restaurantId: membership.restaurant_id,
@@ -438,12 +455,27 @@ export const setDefaultAddress = (db, userId, addressId) => {
 export const createOrderRecord = (db, payload) => {
   const orderId = createId();
   const timestamp = nowIso();
+  const restaurant = db.prepare("SELECT loyalty_points_per_real FROM restaurant LIMIT 1").get();
+  const user = db.prepare("SELECT loyalty_points_balance FROM users WHERE id = ? LIMIT 1").get(payload.userId);
+  const requestedRedeem = Math.max(0, Number(payload.loyaltyPointsRedeemed || 0));
+  const availablePoints = Number(user?.loyalty_points_balance || 0);
+  const redeemableCeiling = Math.max(0, Number(payload.subtotal || 0) - Number(payload.discount || 0));
+  const safeRedeem = Math.min(requestedRedeem, availablePoints, redeemableCeiling);
+  const loyaltyDiscount = Math.min(Math.max(0, Number(payload.loyaltyDiscount || safeRedeem)), safeRedeem);
+  const pointsPerReal = Math.max(0, Number(restaurant?.loyalty_points_per_real || 0));
+  const loyaltyPointsEarned = Number(Math.max(0, ((payload.subtotal || 0) - (payload.discount || 0) - loyaltyDiscount) * pointsPerReal).toFixed(2));
+
+  if (requestedRedeem > availablePoints) {
+    throw new Error("Pontos insuficientes para esse pedido.");
+  }
+
   db.prepare(`
     INSERT INTO orders (
       id, user_id, restaurant_id, status, delivery_mode, payment_method, address_label, address_full,
-      customer_name, customer_phone, coupon_code, subtotal, discount, delivery_fee, total, obs,
+      customer_name, customer_phone, coupon_code, subtotal, discount, delivery_fee, total,
+      loyalty_points_redeemed, loyalty_discount, loyalty_points_earned, obs,
       notes_internal, assigned_driver_id, created_at, latitude, longitude
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     orderId,
     payload.userId,
@@ -460,6 +492,9 @@ export const createOrderRecord = (db, payload) => {
     payload.discount || 0,
     payload.deliveryFee || 0,
     payload.total || 0,
+    safeRedeem,
+    loyaltyDiscount,
+    loyaltyPointsEarned,
     payload.obs || null,
     payload.notesInternal || null,
     payload.assignedDriverId || null,
@@ -467,6 +502,14 @@ export const createOrderRecord = (db, payload) => {
     payload.latitude ?? null,
     payload.longitude ?? null,
   );
+
+  if (safeRedeem > 0) {
+    db.prepare(`
+      UPDATE users
+      SET loyalty_points_balance = MAX(0, loyalty_points_balance - ?), updated_at = ?
+      WHERE id = ?
+    `).run(safeRedeem, timestamp, payload.userId);
+  }
 
   const insertItem = db.prepare(`
     INSERT INTO order_items (
@@ -532,6 +575,9 @@ const mapOrderRow = (db, row) => {
     discount: row.discount,
     deliveryFee: row.delivery_fee,
     total: row.total,
+    loyaltyPointsRedeemed: Number(row.loyalty_points_redeemed || 0),
+    loyaltyDiscount: Number(row.loyalty_discount || 0),
+    loyaltyPointsEarned: Number(row.loyalty_points_earned || 0),
     obs: row.obs,
     notesInternal: row.notes_internal,
     assignedDriverId: row.assigned_driver_id,
@@ -580,6 +626,7 @@ export const listOrdersForRestaurant = (db, restaurantId) => db.prepare(`
 `).all(restaurantId).map((row) => mapOrderRow(db, row));
 
 export const updateOrderStatus = (db, orderId, status, actor) => {
+  const currentOrder = db.prepare("SELECT * FROM orders WHERE id = ? LIMIT 1").get(orderId);
   const timestampFieldMap = {
     confirmed: "confirmed_at",
     preparing: "prepared_at",
@@ -593,6 +640,13 @@ export const updateOrderStatus = (db, orderId, status, actor) => {
   const field = timestampFieldMap[status];
   if (field) {
     db.prepare(`UPDATE orders SET ${field} = ? WHERE id = ?`).run(nowIso(), orderId);
+  }
+  if (status === "delivered" && currentOrder && !currentOrder.delivered_at && Number(currentOrder.loyalty_points_earned || 0) > 0) {
+    db.prepare(`
+      UPDATE users
+      SET loyalty_points_balance = loyalty_points_balance + ?, updated_at = ?
+      WHERE id = ?
+    `).run(Number(currentOrder.loyalty_points_earned || 0), nowIso(), currentOrder.user_id);
   }
   db.prepare(`
     INSERT INTO order_status_events (

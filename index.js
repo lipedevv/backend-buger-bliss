@@ -113,6 +113,38 @@ const resolveCatalogSnapshotUrls = (req, snapshot) => ({
     image: buildAbsoluteAssetUrl(req, product.image),
   })),
 });
+const isDiscountActiveNow = (discount) => {
+  if (!discount?.isActive) return false;
+  const now = Date.now();
+  if (discount.startsAt && new Date(discount.startsAt).getTime() > now) return false;
+  if (discount.endsAt && new Date(discount.endsAt).getTime() < now) return false;
+  return true;
+};
+const buildPublicPromoNotification = () => {
+  const snapshot = getCatalogSnapshot(db);
+  const settings = getPromoNotificationSettings(db);
+  const activeDiscounts = (snapshot.discounts || []).filter(isDiscountActiveNow);
+
+  if (!settings?.enabled || activeDiscounts.length === 0) {
+    return {
+      enabled: false,
+      title: settings?.title || "Promocao nova no app",
+      body: settings?.body || "Tem desconto novo te esperando.",
+      targetPath: settings?.targetPath || "/promos",
+      activeDiscounts: [],
+      updatedAt: settings?.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  return {
+    enabled: true,
+    title: settings.title,
+    body: `${settings.body} ${activeDiscounts[0]?.title ? `Oferta: ${activeDiscounts[0].title}.` : ""}`.trim(),
+    targetPath: settings.targetPath,
+    activeDiscounts,
+    updatedAt: settings.updatedAt,
+  };
+};
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -280,6 +312,10 @@ app.get("/health", (_req, res) => {
 
 app.get("/api/catalog/snapshot", (_req, res) => {
   res.json({ ok: true, snapshot: resolveCatalogSnapshotUrls(_req, getCatalogSnapshot(db)) });
+});
+
+app.get("/api/public/promo-notification", (_req, res) => {
+  res.json({ ok: true, notification: buildPublicPromoNotification() });
 });
 
 app.put("/api/catalog/restaurant", authMiddleware, requireAdmin, (req, res) => {
@@ -456,16 +492,21 @@ app.get("/api/orders/:id", authMiddleware, (req, res) => {
 });
 
 app.post("/api/orders", authMiddleware, (req, res) => {
-  const orderId = createOrderRecord(db, {
-    ...req.body,
-    userId: req.auth.profile.userId,
-    restaurantId: RESTAURANT_ID,
-  });
-  const order = getOrderById(db, orderId);
-  sendOrderStatusMessage(order, "pending").catch((error) => {
-    logger.warn({ error, orderId }, "Falha ao enviar status inicial no WhatsApp");
-  });
-  res.json({ ok: true, order });
+  try {
+    const orderId = createOrderRecord(db, {
+      ...req.body,
+      userId: req.auth.profile.userId,
+      restaurantId: RESTAURANT_ID,
+    });
+    const order = getOrderById(db, orderId);
+    sendOrderStatusMessage(order, "pending").catch((error) => {
+      logger.warn({ error, orderId }, "Falha ao enviar status inicial no WhatsApp");
+    });
+    res.json({ ok: true, order });
+  } catch (error) {
+    logger.warn({ error }, "Falha ao criar pedido");
+    res.status(400).json({ error: error.message || "Falha ao criar pedido." });
+  }
 });
 
 app.patch("/api/orders/:id/status", authMiddleware, (req, res) => {
