@@ -89,6 +89,7 @@ export const initAppDatabase = (db) => {
       phone_verified_at TEXT,
       preferred_role TEXT NOT NULL DEFAULT 'customer',
       loyalty_points_balance REAL NOT NULL DEFAULT 0,
+      is_blocked INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -270,6 +271,7 @@ export const initAppDatabase = (db) => {
   `);
 
   ensureColumn(db, "users", "loyalty_points_balance", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "users", "is_blocked", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "orders", "loyalty_points_redeemed", "REAL NOT NULL DEFAULT 0");
   ensureColumn(db, "orders", "loyalty_discount", "REAL NOT NULL DEFAULT 0");
   ensureColumn(db, "orders", "loyalty_points_earned", "REAL NOT NULL DEFAULT 0");
@@ -359,6 +361,7 @@ const mapProfile = (db, userRow) => ({
   phoneVerifiedAt: userRow.phone_verified_at || null,
   preferredRole: userRow.preferred_role || "customer",
   loyaltyPointsBalance: Number(userRow.loyalty_points_balance || 0),
+  isBlocked: Boolean(userRow.is_blocked),
   memberships: getMembershipRows(db, userRow.id).map((membership) => ({
     id: membership.id,
     restaurantId: membership.restaurant_id,
@@ -1216,4 +1219,137 @@ export const buildAdminDashboardOverview = (db, restaurantId = DEFAULT_RESTAURAN
     topProducts: Array.from(topProductsMap.values()),
     alerts,
   };
+};
+
+export const listAdminCustomers = (db, restaurantId = DEFAULT_RESTAURANT_ID) => {
+  const rows = db.prepare(`
+    SELECT
+      u.id AS user_id,
+      u.name,
+      u.phone,
+      u.loyalty_points_balance,
+      u.is_blocked,
+      MAX(o.created_at) AS last_order_at,
+      COUNT(o.id) AS order_count,
+      SUM(CASE WHEN o.status != 'cancelled' THEN o.total ELSE 0 END) AS total_spent
+    FROM users u
+    JOIN orders o ON o.user_id = u.id
+    WHERE o.restaurant_id = ?
+    GROUP BY u.id, u.name, u.phone, u.loyalty_points_balance, u.is_blocked
+    ORDER BY last_order_at DESC
+  `).all(restaurantId);
+
+  return rows.map((row) => {
+    const address = db.prepare(`
+      SELECT address_full
+      FROM orders
+      WHERE user_id = ?
+        AND restaurant_id = ?
+        AND address_full IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(row.user_id, restaurantId);
+    const totalSpent = Number(row.total_spent || 0);
+    const orderCount = Number(row.order_count || 0);
+    return {
+      userId: row.user_id,
+      name: row.name || "Cliente",
+      phone: row.phone || "",
+      lastAddress: address?.address_full || "",
+      lastOrderAt: row.last_order_at || null,
+      totalSpent,
+      orderCount,
+      averageTicket: orderCount ? totalSpent / orderCount : 0,
+      loyaltyPointsBalance: Number(row.loyalty_points_balance || 0),
+      isBlocked: Boolean(row.is_blocked),
+    };
+  });
+};
+
+export const setCustomerBlocked = (db, userId, isBlocked) => {
+  db.prepare(`
+    UPDATE users
+    SET is_blocked = ?, updated_at = ?
+    WHERE id = ?
+  `).run(isBlocked ? 1 : 0, nowIso(), userId);
+};
+
+export const buildAdminReports = (db, restaurantId = DEFAULT_RESTAURANT_ID) => {
+  const orders = db.prepare(`
+    SELECT *
+    FROM orders
+    WHERE restaurant_id = ?
+    ORDER BY created_at DESC
+  `).all(restaurantId);
+  const totalOrders = orders.length;
+  const deliveredOrders = orders.filter((order) => order.status === "delivered").length;
+  const cancelledOrders = orders.filter((order) => order.status === "cancelled").length;
+  const paymentMethods = db.prepare(`
+    SELECT payment_method, COUNT(*) AS order_count, SUM(total) AS total
+    FROM orders
+    WHERE restaurant_id = ?
+      AND status != 'cancelled'
+    GROUP BY payment_method
+    ORDER BY total DESC
+  `).all(restaurantId).map((row) => ({
+    method: row.payment_method,
+    total: Number(row.total || 0),
+    orderCount: Number(row.order_count || 0),
+  }));
+
+  return {
+    totalOrders,
+    deliveredOrders,
+    cancelledOrders,
+    cancelRate: totalOrders ? (cancelledOrders / totalOrders) * 100 : 0,
+    paymentMethods,
+    topCustomers: listAdminCustomers(db, restaurantId)
+      .sort((left, right) => right.totalSpent - left.totalSpent)
+      .slice(0, 5),
+  };
+};
+
+export const listStaffMembers = (db, restaurantId = DEFAULT_RESTAURANT_ID) => db.prepare(`
+  SELECT m.user_id, m.role, m.is_active, u.name, u.phone
+  FROM memberships m
+  JOIN users u ON u.id = m.user_id
+  WHERE m.restaurant_id = ?
+    AND m.role IN ('admin', 'manager', 'attendant', 'kitchen')
+  ORDER BY m.role, u.name
+`).all(restaurantId).map((row) => ({
+  userId: row.user_id,
+  name: row.name || "Sem nome",
+  phone: row.phone || "",
+  role: row.role,
+  isActive: Boolean(row.is_active),
+}));
+
+export const assignStaffRole = (db, phone, role) => {
+  const normalizedPhone = String(phone || "").replace(/\D/g, "");
+  const user = db.prepare("SELECT * FROM users WHERE phone = ? LIMIT 1").get(normalizedPhone);
+  if (!user) {
+    throw new Error("O telefone informado ainda nao pertence a nenhum usuario.");
+  }
+  const existing = db.prepare(`
+    SELECT *
+    FROM memberships
+    WHERE restaurant_id = ?
+      AND user_id = ?
+    LIMIT 1
+  `).get(DEFAULT_RESTAURANT_ID, user.id);
+
+  if (existing) {
+    db.prepare(`
+      UPDATE memberships
+      SET role = ?, is_active = 1, updated_at = ?
+      WHERE id = ?
+    `).run(role, nowIso(), existing.id);
+  } else {
+    db.prepare(`
+      INSERT INTO memberships (id, restaurant_id, user_id, role, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 1, ?, ?)
+    `).run(createId(), DEFAULT_RESTAURANT_ID, user.id, role, nowIso(), nowIso());
+  }
+
+  return listStaffMembers(db);
 };

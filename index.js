@@ -11,7 +11,9 @@ import QRCode from "qrcode";
 import { Boom } from "@hapi/boom";
 import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, useMultiFileAuthState } from "@whiskeysockets/baileys";
 import {
+  assignStaffRole,
   buildAdminDashboardOverview,
+  buildAdminReports,
   changeAdminPassword,
   countAdminMemberships,
   createAddress,
@@ -36,10 +38,13 @@ import {
   listOrdersForDriver,
   listOrdersForRestaurant,
   listOrdersForUser,
+  listStaffMembers,
   listWhatsappMessageTemplates,
+  listAdminCustomers,
   mapDriverProfile,
   serializeWhatsappSession,
   setDefaultAddress,
+  setCustomerBlocked,
   updateOrderRecord,
   updatePromoNotificationSettings,
   updateWhatsappMessageTemplates,
@@ -541,6 +546,9 @@ app.get("/api/orders/:id", authMiddleware, (req, res) => {
 
 app.post("/api/orders", authMiddleware, (req, res) => {
   try {
+    if (req.auth.profile.isBlocked) {
+      return res.status(403).json({ error: "Seu cadastro esta bloqueado para novos pedidos." });
+    }
     const orderId = createOrderRecord(db, {
       ...req.body,
       userId: req.auth.profile.userId,
@@ -633,6 +641,9 @@ app.get("/api/admin/dashboard", authMiddleware, requireAdmin, (_req, res) => {
       ...snapshot,
       recentOrders: listOrdersForRestaurant(db, RESTAURANT_ID),
       overview: buildAdminDashboardOverview(db, RESTAURANT_ID),
+      customers: listAdminCustomers(db, RESTAURANT_ID),
+      reports: buildAdminReports(db, RESTAURANT_ID),
+      staff: listStaffMembers(db, RESTAURANT_ID),
       drivers: listDriverProfiles(db),
       whatsappSession: serializeWhatsappSession(getWhatsappSessionRow(db)),
       promoNotificationSettings: getPromoNotificationSettings(db),
@@ -653,6 +664,20 @@ app.put("/api/admin/promo-settings", authMiddleware, requireAdmin, (req, res) =>
 app.put("/api/admin/whatsapp-templates", authMiddleware, requireAdmin, (req, res) => {
   const templates = updateWhatsappMessageTemplates(db, req.body?.templates || []);
   res.json({ ok: true, templates });
+});
+
+app.patch("/api/admin/customers/:userId/block", authMiddleware, requireAdmin, (req, res) => {
+  setCustomerBlocked(db, req.params.userId, Boolean(req.body?.isBlocked));
+  res.json({ ok: true, customers: listAdminCustomers(db, RESTAURANT_ID) });
+});
+
+app.put("/api/admin/staff", authMiddleware, requireAdmin, (req, res) => {
+  try {
+    const staff = assignStaffRole(db, req.body?.phone, req.body?.role);
+    res.json({ ok: true, staff });
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Falha ao atualizar permissao." });
+  }
 });
 
 app.post("/api/driver/profile", authMiddleware, (req, res) => {
