@@ -631,6 +631,23 @@ const mapOrderRow = (db, row) => {
   const location = row.assigned_driver_id
     ? db.prepare("SELECT * FROM driver_locations WHERE order_id = ? ORDER BY created_at DESC LIMIT 1").get(row.id)
     : null;
+  const assignedDriverRow = row.assigned_driver_id
+    ? db.prepare("SELECT * FROM driver_profiles WHERE id = ? LIMIT 1").get(row.assigned_driver_id)
+    : null;
+  const statusHistory = db.prepare(`
+    SELECT *
+    FROM order_status_events
+    WHERE order_id = ?
+    ORDER BY created_at ASC
+  `).all(row.id).map((event) => ({
+    id: event.id,
+    orderId: event.order_id,
+    status: event.status,
+    note: event.note || "",
+    actorUserId: event.actor_user_id || null,
+    actorRole: event.actor_role || "system",
+    createdAt: event.created_at,
+  }));
 
   return {
     id: row.id,
@@ -675,6 +692,15 @@ const mapOrderRow = (db, row) => {
       batteryLevel: location.battery_level,
       createdAt: location.created_at,
     } : null,
+    assignedDriver: assignedDriverRow ? {
+      id: assignedDriverRow.id,
+      displayName: assignedDriverRow.display_name,
+      phone: assignedDriverRow.phone || "",
+      vehicleLabel: assignedDriverRow.vehicle_label || "",
+      vehiclePlate: assignedDriverRow.vehicle_plate || "",
+      isOnline: Boolean(assignedDriverRow.is_online),
+    } : null,
+    statusHistory,
   };
 };
 

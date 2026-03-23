@@ -307,6 +307,14 @@ const ensureSocket = async () => {
   return socket;
 };
 
+const triggerSocketConnection = () => {
+  ensureSocket().catch((error) => {
+    logger.error({ error }, "Falha ao iniciar conexao do WhatsApp");
+    updateWhatsappSessionRow(db, { status: "error", error_message: error.message || "Falha ao conectar." });
+    clearSocket();
+  });
+};
+
 const sendVerificationMessage = async (phone, code) => {
   if (!state.socket) {
     throw new Error("WhatsApp ainda nao esta conectado.");
@@ -733,7 +741,8 @@ app.get("/api/whatsapp/status", (_req, res) => {
 
 app.post("/api/whatsapp/connect", authMiddleware, requireAdmin, async (_req, res) => {
   try {
-    await ensureSocket();
+    updateWhatsappSessionRow(db, { status: "connecting", error_message: null });
+    triggerSocketConnection();
     res.json({ ok: true, session: serializeWhatsappSession(getWhatsappSessionRow(db)) });
   } catch (error) {
     logger.error({ error }, "Falha ao conectar WhatsApp");
