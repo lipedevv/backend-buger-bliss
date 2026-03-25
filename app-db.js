@@ -272,9 +272,25 @@ export const initAppDatabase = (db) => {
 
   ensureColumn(db, "users", "loyalty_points_balance", "REAL NOT NULL DEFAULT 0");
   ensureColumn(db, "users", "is_blocked", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "orders", "notes_internal", "TEXT");
+  ensureColumn(db, "orders", "assigned_driver_id", "TEXT");
+  ensureColumn(db, "orders", "confirmed_at", "TEXT");
+  ensureColumn(db, "orders", "prepared_at", "TEXT");
+  ensureColumn(db, "orders", "dispatched_at", "TEXT");
+  ensureColumn(db, "orders", "delivered_at", "TEXT");
+  ensureColumn(db, "orders", "cancelled_at", "TEXT");
+  ensureColumn(db, "orders", "latitude", "REAL");
+  ensureColumn(db, "orders", "longitude", "REAL");
   ensureColumn(db, "orders", "loyalty_points_redeemed", "REAL NOT NULL DEFAULT 0");
   ensureColumn(db, "orders", "loyalty_discount", "REAL NOT NULL DEFAULT 0");
   ensureColumn(db, "orders", "loyalty_points_earned", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "order_items", "product_slug", "TEXT");
+  ensureColumn(db, "order_items", "option_snapshot", "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(db, "order_status_events", "note", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "order_status_events", "actor_user_id", "TEXT");
+  ensureColumn(db, "order_status_events", "actor_role", "TEXT NOT NULL DEFAULT 'system'");
+  ensureColumn(db, "order_status_events", "latitude", "REAL");
+  ensureColumn(db, "order_status_events", "longitude", "REAL");
 
   const hasWhatsappSession = db.prepare("SELECT id FROM whatsapp_sessions WHERE restaurant_id = ?").get(DEFAULT_RESTAURANT_ID);
   if (!hasWhatsappSession) {
@@ -548,7 +564,7 @@ export const createOrderRecord = (db, payload) => {
       customer_name, customer_phone, coupon_code, subtotal, discount, delivery_fee, total,
       loyalty_points_redeemed, loyalty_discount, loyalty_points_earned, obs,
       notes_internal, assigned_driver_id, created_at, latitude, longitude
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     orderId,
     payload.userId,

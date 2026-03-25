@@ -65,6 +65,14 @@ const DEFAULT_OPTIONS = DEFAULT_OPTION_GROUPS.flatMap((group, groupIndex) => [
   { id: `option-${groupIndex + 1}-5`, group_id: group.id, name: "Molho especial", price: 2, is_active: 1, sort_order: 4 },
 ]);
 
+const hasColumn = (db, tableName, columnName) => db.prepare(`PRAGMA table_info(${tableName})`).all()
+  .some((column) => column.name === columnName);
+const ensureColumn = (db, tableName, columnName, definition) => {
+  if (!hasColumn(db, tableName, columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+};
+
 export const initCatalogDatabase = (dbPath) => {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
@@ -193,6 +201,30 @@ export const initCatalogDatabase = (dbPath) => {
       is_active INTEGER NOT NULL DEFAULT 1
     );
   `);
+
+  ensureColumn(db, "restaurant", "hero_image_url", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "address_line", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "neighborhood", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "city", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "state", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "postal_code", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "latitude", "REAL");
+  ensureColumn(db, "restaurant", "longitude", "REAL");
+  ensureColumn(db, "restaurant", "free_delivery_min", "REAL");
+  ensureColumn(db, "restaurant", "pickup_eta_min", "INTEGER NOT NULL DEFAULT 15");
+  ensureColumn(db, "restaurant", "pickup_eta_max", "INTEGER NOT NULL DEFAULT 25");
+  ensureColumn(db, "restaurant", "delivery_eta_min", "INTEGER NOT NULL DEFAULT 30");
+  ensureColumn(db, "restaurant", "delivery_eta_max", "INTEGER NOT NULL DEFAULT 45");
+  ensureColumn(db, "restaurant", "delivery_tracking_enabled", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(db, "restaurant", "loyalty_enabled", "INTEGER NOT NULL DEFAULT 1");
+  ensureColumn(db, "restaurant", "loyalty_points_per_real", "REAL NOT NULL DEFAULT 1");
+  ensureColumn(db, "restaurant", "status", "TEXT NOT NULL DEFAULT 'active'");
+  ensureColumn(db, "restaurant", "updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
+  ensureColumn(db, "products", "compare_at_price", "REAL");
+  ensureColumn(db, "discounts", "starts_at", "TEXT");
+  ensureColumn(db, "discounts", "ends_at", "TEXT");
+  ensureColumn(db, "discounts", "usage_limit", "INTEGER");
+  ensureColumn(db, "discounts", "per_user_limit", "INTEGER");
 
   seedDefaults(db);
   return db;

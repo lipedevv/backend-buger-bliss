@@ -568,7 +568,7 @@ app.post("/api/orders", authMiddleware, (req, res) => {
     });
     res.json({ ok: true, order });
   } catch (error) {
-    logger.warn({ error }, "Falha ao criar pedido");
+    logger.warn({ error, errorMessage: error?.message, errorCode: error?.code }, "Falha ao criar pedido");
     res.status(400).json({ error: error.message || "Falha ao criar pedido." });
   }
 });
