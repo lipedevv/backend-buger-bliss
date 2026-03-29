@@ -14,12 +14,15 @@ import {
   assignStaffRole,
   buildAdminDashboardOverview,
   buildAdminReports,
+  buildReferralMetrics,
   changeAdminPassword,
   countAdminMemberships,
   createAddress,
+  createDriverProfileForAdmin,
   createDriverLocation,
   createOrderRecord,
   createPhoneVerification,
+  deleteDriverProfileRecord,
   createUserSession,
   deleteAddress,
   deleteSession,
@@ -48,6 +51,7 @@ import {
   updateOrderRecord,
   updatePromoNotificationSettings,
   updateWhatsappMessageTemplates,
+  updateDriverProfileForAdmin,
   updateDriverProfileRecord,
   updateOrderStatus,
   updateWhatsappSessionRow,
@@ -120,6 +124,10 @@ const resolveCatalogSnapshotUrls = (req, snapshot) => ({
     ...product,
     image: buildAbsoluteAssetUrl(req, product.image),
   })),
+  discounts: snapshot.discounts.map((discount) => ({
+    ...discount,
+    imageUrl: buildAbsoluteAssetUrl(req, discount.imageUrl),
+  })),
 });
 const isDiscountActiveNow = (discount) => {
   if (!discount?.isActive) return false;
@@ -132,26 +140,66 @@ const buildPublicPromoNotification = () => {
   const snapshot = getCatalogSnapshot(db);
   const settings = getPromoNotificationSettings(db);
   const activeDiscounts = (snapshot.discounts || []).filter(isDiscountActiveNow);
+  const upcomingDiscount = [...(snapshot.discounts || [])]
+    .filter((discount) => discount?.isActive && discount.startsAt && new Date(discount.startsAt).getTime() > Date.now())
+    .sort((left, right) => new Date(left.startsAt).getTime() - new Date(right.startsAt).getTime())[0];
 
-  if (!settings?.enabled || activeDiscounts.length === 0) {
+  if (!settings?.enabled) {
     return {
       enabled: false,
       title: settings?.title || "Promocao nova no app",
       body: settings?.body || "Tem desconto novo te esperando.",
       targetPath: settings?.targetPath || "/promos",
       activeDiscounts: [],
+      upcomingDiscount: null,
       updatedAt: settings?.updatedAt || new Date().toISOString(),
+    };
+  }
+
+  if (activeDiscounts.length === 0 && !upcomingDiscount) {
+    return {
+      enabled: false,
+      title: settings.title,
+      body: settings.body,
+      targetPath: settings.targetPath,
+      activeDiscounts: [],
+      upcomingDiscount: null,
+      updatedAt: settings.updatedAt,
     };
   }
 
   return {
     enabled: true,
     title: settings.title,
-    body: `${settings.body} ${activeDiscounts[0]?.title ? `Oferta: ${activeDiscounts[0].title}.` : ""}`.trim(),
+    body: `${settings.body} ${activeDiscounts[0]?.title ? `Oferta: ${activeDiscounts[0].title}.` : upcomingDiscount?.title ? `Agendada: ${upcomingDiscount.title}.` : ""}`.trim(),
     targetPath: settings.targetPath,
     activeDiscounts,
+    upcomingDiscount: upcomingDiscount || null,
     updatedAt: settings.updatedAt,
   };
+};
+
+const parseTimeToMinutes = (value) => {
+  if (!value) return null;
+  const [hours, minutes] = String(value).split(":").map(Number);
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) return null;
+  return hours * 60 + minutes;
+};
+const isRestaurantAcceptingOrdersNow = (restaurant, date = new Date()) => {
+  if (!restaurant?.acceptsOrders || restaurant?.status !== "active") return false;
+  const todayHours = (restaurant.hours || []).find((entry) => entry.weekday === date.getDay());
+  if (!todayHours || todayHours.isClosed) return false;
+
+  const opensAt = parseTimeToMinutes(todayHours.opensAt);
+  const closesAt = parseTimeToMinutes(todayHours.closesAt);
+  if (opensAt == null || closesAt == null) return false;
+
+  const currentMinutes = date.getHours() * 60 + date.getMinutes();
+  if (closesAt <= opensAt) {
+    return currentMinutes >= opensAt || currentMinutes <= closesAt;
+  }
+
+  return currentMinutes >= opensAt && currentMinutes <= closesAt;
 };
 
 const upload = multer({
@@ -221,6 +269,9 @@ const formatOrderItemsBlock = (order) => (order?.items || []).map((item) => {
   ].filter(Boolean).join("\n");
 }).join("\n");
 const buildObsBlock = (order) => order?.obs ? `*OBS: ${order.obs}*` : "";
+const buildCouponBlock = (order) => order?.couponCode ? `Cupom aplicado: *${order.couponCode}*` : "";
+const buildDiscountBlock = (order) => Number(order?.discount || 0) > 0 ? `- Desconto: *${currency(order.discount)}*` : "";
+const buildLoyaltyDiscountBlock = (order) => Number(order?.loyaltyDiscount || 0) > 0 ? `- Pontos usados: *${currency(order.loyaltyDiscount)}*` : "";
 const buildDeliveryFeeBlock = (order) => Number(order?.deliveryFee || 0) > 0 ? `+ Taxa de entrega: *${currency(order.deliveryFee)}*` : "";
 const buildTemplateVariables = (order) => ({
   customer_name: order?.customerName || "cliente",
@@ -228,6 +279,9 @@ const buildTemplateVariables = (order) => ({
   payment_method: friendlyPaymentMethod(order?.paymentMethod),
   payment_emoji: paymentEmoji(order?.paymentMethod),
   items_total: currency(order?.subtotal || 0),
+  coupon_block: buildCouponBlock(order),
+  discount_block: buildDiscountBlock(order),
+  loyalty_discount_block: buildLoyaltyDiscountBlock(order),
   delivery_fee_block: buildDeliveryFeeBlock(order),
   total: currency(order?.total || 0),
   delivery_mode_label: friendlyDeliveryLabel(order),
@@ -457,11 +511,40 @@ app.get("/api/auth/me", authMiddleware, (req, res) => {
 });
 
 app.patch("/api/profile", authMiddleware, (req, res) => {
+  const timestamp = new Date().toISOString();
+  const currentUser = db.prepare("SELECT * FROM users WHERE id = ? LIMIT 1").get(req.auth.profile.userId);
+  const referredByCode = String(req.body.referredByCode || "").trim().toUpperCase();
+
+  if (referredByCode) {
+    if (currentUser?.referred_by_user_id) {
+      return res.status(400).json({ error: "Voce ja vinculou um codigo de indicacao." });
+    }
+    const existingOrders = db.prepare("SELECT COUNT(*) AS total FROM orders WHERE user_id = ?").get(req.auth.profile.userId);
+    if (Number(existingOrders?.total || 0) > 0) {
+      return res.status(400).json({ error: "O codigo de indicacao so pode ser usado antes do primeiro pedido." });
+    }
+
+    const referrer = db.prepare("SELECT id FROM users WHERE referral_code = ? LIMIT 1").get(referredByCode);
+    if (!referrer) {
+      return res.status(404).json({ error: "Codigo de indicacao nao encontrado." });
+    }
+    if (referrer.id === req.auth.profile.userId) {
+      return res.status(400).json({ error: "Voce nao pode usar o proprio codigo." });
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET referred_by_user_id = ?, updated_at = ?
+      WHERE id = ?
+    `).run(referrer.id, timestamp, req.auth.profile.userId);
+  }
+
   db.prepare(`
     UPDATE users
     SET name = COALESCE(?, name), updated_at = ?
     WHERE id = ?
-  `).run(req.body.name || null, new Date().toISOString(), req.auth.profile.userId);
+  `).run(req.body.name || null, timestamp, req.auth.profile.userId);
+
   const refreshed = getSessionUser(db, req.auth.token);
   res.json({ ok: true, profile: refreshed.profile });
 });
@@ -556,6 +639,10 @@ app.post("/api/orders", authMiddleware, (req, res) => {
   try {
     if (req.auth.profile.isBlocked) {
       return res.status(403).json({ error: "Seu cadastro esta bloqueado para novos pedidos." });
+    }
+    const snapshot = getCatalogSnapshot(db);
+    if (!isRestaurantAcceptingOrdersNow(snapshot.restaurant)) {
+      return res.status(400).json({ error: "A loja esta fechada no momento e nao esta aceitando pedidos." });
     }
     const orderId = createOrderRecord(db, {
       ...req.body,
@@ -653,6 +740,7 @@ app.get("/api/admin/dashboard", authMiddleware, requireAdmin, (_req, res) => {
       reports: buildAdminReports(db, RESTAURANT_ID),
       staff: listStaffMembers(db, RESTAURANT_ID),
       drivers: listDriverProfiles(db),
+      referralMetrics: buildReferralMetrics(db, RESTAURANT_ID),
       whatsappSession: serializeWhatsappSession(getWhatsappSessionRow(db)),
       promoNotificationSettings: getPromoNotificationSettings(db),
       whatsappTemplates: listWhatsappMessageTemplates(db),
@@ -692,9 +780,35 @@ app.put("/api/admin/staff", authMiddleware, requireAdmin, (req, res) => {
   }
 });
 
+app.post("/api/admin/drivers", authMiddleware, requireAdmin, (req, res) => {
+  try {
+    const driver = createDriverProfileForAdmin(db, req.body || {});
+    res.json({ ok: true, driver, drivers: listDriverProfiles(db) });
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Falha ao cadastrar entregador." });
+  }
+});
+
+app.patch("/api/admin/drivers/:id", authMiddleware, requireAdmin, (req, res) => {
+  try {
+    const driver = updateDriverProfileForAdmin(db, req.params.id, req.body || {});
+    res.json({ ok: true, driver, drivers: listDriverProfiles(db) });
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Falha ao atualizar entregador." });
+  }
+});
+
+app.delete("/api/admin/drivers/:id", authMiddleware, requireAdmin, (req, res) => {
+  try {
+    deleteDriverProfileRecord(db, req.params.id);
+    res.json({ ok: true, drivers: listDriverProfiles(db) });
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Falha ao excluir entregador." });
+  }
+});
+
 app.post("/api/driver/profile", authMiddleware, (req, res) => {
-  const row = upsertDriverProfileRecord(db, req.auth.profile.userId, req.body);
-  res.json({ ok: true, driver: mapDriverProfile(row) });
+  return res.status(403).json({ error: "O cadastro de entregadores deve ser feito pelo admin." });
 });
 
 app.patch("/api/driver/profile", authMiddleware, (req, res) => {
@@ -702,7 +816,10 @@ app.patch("/api/driver/profile", authMiddleware, (req, res) => {
   if (!row) {
     return res.status(404).json({ error: "Perfil de entregador nao encontrado." });
   }
-  updateDriverProfileRecord(db, row.id, req.body);
+  updateDriverProfileRecord(db, row.id, {
+    isOnline: req.body?.isOnline,
+    isAvailable: req.body?.isAvailable,
+  });
   res.json({ ok: true, driver: getDriverProfileByUser(db, req.auth.profile.userId) });
 });
 

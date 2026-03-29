@@ -46,7 +46,7 @@ const DEFAULT_DELIVERY_ZONES = [
 ];
 
 const DEFAULT_DISCOUNTS = [
-  { id: "71111111-1111-4111-8111-111111111111", code: "SMASH10", title: "Primeira compra", description: "Ganhe 10 por cento de desconto na primeira compra.", type: "percentage", value: 10, min_order_amount: 20, max_discount_amount: 15, usage_limit: null, per_user_limit: 1, applies_to_delivery: 1, applies_to_pickup: 1, starts_at: null, ends_at: null, is_active: 1 },
+  { id: "71111111-1111-4111-8111-111111111111", code: "SMASH10", title: "Primeira compra", description: "Ganhe 10 por cento de desconto na primeira compra.", image_url: "", type: "percentage", value: 10, min_order_amount: 20, max_discount_amount: 15, usage_limit: null, per_user_limit: 1, applies_to_delivery: 1, applies_to_pickup: 1, starts_at: null, ends_at: null, is_active: 1 },
 ];
 
 const DEFAULT_OPTION_GROUPS = [
@@ -94,6 +94,7 @@ export const initCatalogDatabase = (dbPath) => {
       city TEXT NOT NULL DEFAULT '',
       state TEXT NOT NULL DEFAULT '',
       postal_code TEXT NOT NULL DEFAULT '',
+      delivery_cities TEXT NOT NULL DEFAULT '[]',
       latitude REAL,
       longitude REAL,
       delivery_fee REAL NOT NULL DEFAULT 0,
@@ -107,6 +108,8 @@ export const initCatalogDatabase = (dbPath) => {
       delivery_tracking_enabled INTEGER NOT NULL DEFAULT 1,
       loyalty_enabled INTEGER NOT NULL DEFAULT 1,
       loyalty_points_per_real REAL NOT NULL DEFAULT 1,
+      referral_enabled INTEGER NOT NULL DEFAULT 0,
+      referral_reward_amount REAL NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'active',
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -188,6 +191,7 @@ export const initCatalogDatabase = (dbPath) => {
       code TEXT NOT NULL UNIQUE,
       title TEXT NOT NULL,
       description TEXT NOT NULL DEFAULT '',
+      image_url TEXT NOT NULL DEFAULT '',
       type TEXT NOT NULL DEFAULT 'percentage',
       value REAL NOT NULL DEFAULT 0,
       min_order_amount REAL NOT NULL DEFAULT 0,
@@ -208,6 +212,7 @@ export const initCatalogDatabase = (dbPath) => {
   ensureColumn(db, "restaurant", "city", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "restaurant", "state", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "restaurant", "postal_code", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "restaurant", "delivery_cities", "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(db, "restaurant", "latitude", "REAL");
   ensureColumn(db, "restaurant", "longitude", "REAL");
   ensureColumn(db, "restaurant", "free_delivery_min", "REAL");
@@ -218,6 +223,8 @@ export const initCatalogDatabase = (dbPath) => {
   ensureColumn(db, "restaurant", "delivery_tracking_enabled", "INTEGER NOT NULL DEFAULT 1");
   ensureColumn(db, "restaurant", "loyalty_enabled", "INTEGER NOT NULL DEFAULT 1");
   ensureColumn(db, "restaurant", "loyalty_points_per_real", "REAL NOT NULL DEFAULT 1");
+  ensureColumn(db, "restaurant", "referral_enabled", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "restaurant", "referral_reward_amount", "REAL NOT NULL DEFAULT 0");
   ensureColumn(db, "restaurant", "status", "TEXT NOT NULL DEFAULT 'active'");
   ensureColumn(db, "restaurant", "updated_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
   ensureColumn(db, "products", "compare_at_price", "REAL");
@@ -225,6 +232,7 @@ export const initCatalogDatabase = (dbPath) => {
   ensureColumn(db, "discounts", "ends_at", "TEXT");
   ensureColumn(db, "discounts", "usage_limit", "INTEGER");
   ensureColumn(db, "discounts", "per_user_limit", "INTEGER");
+  ensureColumn(db, "discounts", "image_url", "TEXT NOT NULL DEFAULT ''");
 
   seedDefaults(db);
   return db;
@@ -237,16 +245,16 @@ const seedDefaults = (db) => {
   db.prepare(`
     INSERT INTO restaurant (
       id, slug, name, description, phone, whatsapp_phone, email, logo_url, hero_image_url,
-      address_line, neighborhood, city, state, postal_code, latitude, longitude,
+      address_line, neighborhood, city, state, postal_code, delivery_cities, latitude, longitude,
       delivery_fee, min_order_amount, free_delivery_min, pickup_eta_min, pickup_eta_max,
       delivery_eta_min, delivery_eta_max, accepts_orders, delivery_tracking_enabled,
-      loyalty_enabled, loyalty_points_per_real, status
+      loyalty_enabled, loyalty_points_per_real, referral_enabled, referral_reward_amount, status
     ) VALUES (
       @id, @slug, @name, @description, @phone, @whatsapp_phone, @email, @logo_url, @hero_image_url,
-      @address_line, @neighborhood, @city, @state, @postal_code, @latitude, @longitude,
+      @address_line, @neighborhood, @city, @state, @postal_code, @delivery_cities, @latitude, @longitude,
       @delivery_fee, @min_order_amount, @free_delivery_min, @pickup_eta_min, @pickup_eta_max,
       @delivery_eta_min, @delivery_eta_max, @accepts_orders, @delivery_tracking_enabled,
-      @loyalty_enabled, @loyalty_points_per_real, @status
+      @loyalty_enabled, @loyalty_points_per_real, @referral_enabled, @referral_reward_amount, @status
     )
   `).run({
     id: DEFAULT_RESTAURANT_ID,
@@ -263,6 +271,7 @@ const seedDefaults = (db) => {
     city: "Sao Paulo",
     state: "SP",
     postal_code: "01305000",
+    delivery_cities: JSON.stringify(["Sao Paulo"]),
     latitude: -23.5572,
     longitude: -46.657,
     delivery_fee: 6.9,
@@ -276,6 +285,8 @@ const seedDefaults = (db) => {
     delivery_tracking_enabled: 1,
     loyalty_enabled: 1,
     loyalty_points_per_real: 1,
+    referral_enabled: 1,
+    referral_reward_amount: 10,
     status: "active",
   });
 
@@ -300,7 +311,7 @@ const seedDefaults = (db) => {
   const insertZone = db.prepare("INSERT INTO delivery_zones (id, name, fee, min_eta_minutes, max_eta_minutes, min_order_amount, is_active, geojson) VALUES (@id, @name, @fee, @min_eta_minutes, @max_eta_minutes, @min_order_amount, @is_active, @geojson)");
   DEFAULT_DELIVERY_ZONES.forEach((row) => insertZone.run(row));
 
-  const insertDiscount = db.prepare("INSERT INTO discounts (id, code, title, description, type, value, min_order_amount, max_discount_amount, usage_limit, per_user_limit, applies_to_delivery, applies_to_pickup, starts_at, ends_at, is_active) VALUES (@id, @code, @title, @description, @type, @value, @min_order_amount, @max_discount_amount, @usage_limit, @per_user_limit, @applies_to_delivery, @applies_to_pickup, @starts_at, @ends_at, @is_active)");
+  const insertDiscount = db.prepare("INSERT INTO discounts (id, code, title, description, image_url, type, value, min_order_amount, max_discount_amount, usage_limit, per_user_limit, applies_to_delivery, applies_to_pickup, starts_at, ends_at, is_active) VALUES (@id, @code, @title, @description, @image_url, @type, @value, @min_order_amount, @max_discount_amount, @usage_limit, @per_user_limit, @applies_to_delivery, @applies_to_pickup, @starts_at, @ends_at, @is_active)");
   DEFAULT_DISCOUNTS.forEach((row) => insertDiscount.run(row));
 };
 
@@ -361,6 +372,7 @@ export const getCatalogSnapshot = (db) => {
       city: restaurant.city,
       state: restaurant.state,
       postalCode: restaurant.postal_code,
+      deliveryCities: JSON.parse(restaurant.delivery_cities || "[]"),
       latitude: restaurant.latitude,
       longitude: restaurant.longitude,
       deliveryFee: restaurant.delivery_fee,
@@ -374,6 +386,8 @@ export const getCatalogSnapshot = (db) => {
       deliveryTrackingEnabled: mapBoolean(restaurant.delivery_tracking_enabled),
       loyaltyEnabled: mapBoolean(restaurant.loyalty_enabled),
       loyaltyPointsPerReal: restaurant.loyalty_points_per_real,
+      referralEnabled: mapBoolean(restaurant.referral_enabled),
+      referralRewardAmount: Number(restaurant.referral_reward_amount || 0),
       status: restaurant.status,
       hours: hours.map((hour) => ({
         id: hour.id,
@@ -429,6 +443,7 @@ export const getCatalogSnapshot = (db) => {
       code: discount.code,
       title: discount.title,
       description: discount.description,
+      imageUrl: discount.image_url || "",
       type: discount.type,
       value: discount.value,
       minOrderAmount: discount.min_order_amount,
@@ -459,6 +474,7 @@ export const updateRestaurantRecord = (db, restaurant) => {
       city = @city,
       state = @state,
       postal_code = @postalCode,
+      delivery_cities = @deliveryCities,
       latitude = @latitude,
       longitude = @longitude,
       delivery_fee = @deliveryFee,
@@ -472,6 +488,8 @@ export const updateRestaurantRecord = (db, restaurant) => {
       delivery_tracking_enabled = @deliveryTrackingEnabled,
       loyalty_enabled = @loyaltyEnabled,
       loyalty_points_per_real = @loyaltyPointsPerReal,
+      referral_enabled = @referralEnabled,
+      referral_reward_amount = @referralRewardAmount,
       status = @status,
       updated_at = CURRENT_TIMESTAMP
     WHERE id = @id
@@ -480,6 +498,9 @@ export const updateRestaurantRecord = (db, restaurant) => {
     acceptsOrders: restaurant.acceptsOrders ? 1 : 0,
     deliveryTrackingEnabled: restaurant.deliveryTrackingEnabled ? 1 : 0,
     loyaltyEnabled: restaurant.loyaltyEnabled ? 1 : 0,
+    referralEnabled: restaurant.referralEnabled ? 1 : 0,
+    referralRewardAmount: Number(restaurant.referralRewardAmount || 0),
+    deliveryCities: JSON.stringify(restaurant.deliveryCities || []),
   });
 };
 
@@ -554,12 +575,13 @@ export const saveProductRecord = (db, product) => {
 
 export const saveDiscountRecord = (db, discount) => {
   db.prepare(`
-    INSERT INTO discounts (id, code, title, description, type, value, min_order_amount, max_discount_amount, usage_limit, per_user_limit, applies_to_delivery, applies_to_pickup, starts_at, ends_at, is_active)
-    VALUES (@id, @code, @title, @description, @type, @value, @minOrderAmount, @maxDiscountAmount, @usageLimit, @perUserLimit, @appliesToDelivery, @appliesToPickup, @startsAt, @endsAt, @isActive)
+    INSERT INTO discounts (id, code, title, description, image_url, type, value, min_order_amount, max_discount_amount, usage_limit, per_user_limit, applies_to_delivery, applies_to_pickup, starts_at, ends_at, is_active)
+    VALUES (@id, @code, @title, @description, @imageUrl, @type, @value, @minOrderAmount, @maxDiscountAmount, @usageLimit, @perUserLimit, @appliesToDelivery, @appliesToPickup, @startsAt, @endsAt, @isActive)
     ON CONFLICT(id) DO UPDATE SET
       code = excluded.code,
       title = excluded.title,
       description = excluded.description,
+      image_url = excluded.image_url,
       type = excluded.type,
       value = excluded.value,
       min_order_amount = excluded.min_order_amount,
@@ -576,6 +598,7 @@ export const saveDiscountRecord = (db, discount) => {
     code: discount.code.toUpperCase(),
     title: discount.title,
     description: discount.description || "",
+    imageUrl: discount.imageUrl || "",
     type: discount.type,
     value: discount.value,
     minOrderAmount: discount.minOrderAmount ?? 0,

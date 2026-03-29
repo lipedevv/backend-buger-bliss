@@ -22,6 +22,9 @@ const DEFAULT_WHATSAPP_TEMPLATES = [
       "Forma de Pagamento: *{{payment_method}}* {{payment_emoji}}",
       "",
       "Valor itens: *{{items_total}}*",
+      "{{coupon_block}}",
+      "{{discount_block}}",
+      "{{loyalty_discount_block}}",
       "{{delivery_fee_block}}",
       "= Valor Total: *{{total}}*",
       "",
@@ -78,6 +81,46 @@ const ensureColumn = (db, tableName, columnName, definition) => {
     db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
   }
 };
+const buildReferralCode = (seed = "") => {
+  const sanitized = String(seed).replace(/[^a-z0-9]/gi, "").toUpperCase();
+  const prefix = sanitized.slice(0, 4).padEnd(4, "X");
+  const suffix = crypto.randomBytes(2).toString("hex").toUpperCase();
+  return `CHEF${prefix}${suffix}`;
+};
+const ensureUniqueReferralCode = (db, seed = "") => {
+  let referralCode = buildReferralCode(seed);
+  while (db.prepare("SELECT id FROM users WHERE referral_code = ? LIMIT 1").get(referralCode)) {
+    referralCode = buildReferralCode(seed);
+  }
+  return referralCode;
+};
+const isDiscountActiveForOrder = (discount, deliveryMode) => {
+  if (!discount || !Number(discount.is_active)) return false;
+  if (deliveryMode === "delivery" && !Number(discount.applies_to_delivery)) return false;
+  if (deliveryMode === "pickup" && !Number(discount.applies_to_pickup)) return false;
+
+  const now = Date.now();
+  if (discount.starts_at && new Date(discount.starts_at).getTime() > now) return false;
+  if (discount.ends_at && new Date(discount.ends_at).getTime() < now) return false;
+  return true;
+};
+const calculateDiscountAmount = (discount, subtotal, deliveryFee, deliveryMode) => {
+  if (!discount || !isDiscountActiveForOrder(discount, deliveryMode)) return 0;
+  if (subtotal < Number(discount.min_order_amount || 0)) return 0;
+  if (discount.type === "free_delivery") {
+    return deliveryMode === "delivery" ? Math.max(0, Number(deliveryFee || 0)) : 0;
+  }
+
+  const baseValue = discount.type === "percentage"
+    ? Math.max(0, Number(subtotal || 0)) * (Number(discount.value || 0) / 100)
+    : Math.max(0, Number(discount.value || 0));
+
+  if (discount.max_discount_amount == null) {
+    return Number(baseValue.toFixed(2));
+  }
+
+  return Number(Math.min(baseValue, Number(discount.max_discount_amount || 0)).toFixed(2));
+};
 
 export const initAppDatabase = (db) => {
   db.exec(`
@@ -89,6 +132,9 @@ export const initAppDatabase = (db) => {
       phone_verified_at TEXT,
       preferred_role TEXT NOT NULL DEFAULT 'customer',
       loyalty_points_balance REAL NOT NULL DEFAULT 0,
+      referral_code TEXT,
+      referred_by_user_id TEXT,
+      referral_reward_granted_at TEXT,
       is_blocked INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -121,6 +167,7 @@ export const initAppDatabase = (db) => {
       complement TEXT DEFAULT '',
       neighborhood TEXT NOT NULL DEFAULT '',
       city TEXT NOT NULL DEFAULT '',
+      postal_code TEXT NOT NULL DEFAULT '',
       is_default INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
@@ -271,7 +318,11 @@ export const initAppDatabase = (db) => {
   `);
 
   ensureColumn(db, "users", "loyalty_points_balance", "REAL NOT NULL DEFAULT 0");
+  ensureColumn(db, "users", "referral_code", "TEXT");
+  ensureColumn(db, "users", "referred_by_user_id", "TEXT");
+  ensureColumn(db, "users", "referral_reward_granted_at", "TEXT");
   ensureColumn(db, "users", "is_blocked", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "addresses", "postal_code", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "orders", "notes_internal", "TEXT");
   ensureColumn(db, "orders", "assigned_driver_id", "TEXT");
   ensureColumn(db, "orders", "confirmed_at", "TEXT");
@@ -304,9 +355,16 @@ export const initAppDatabase = (db) => {
   const adminUser = db.prepare("SELECT id FROM users WHERE id = ? LIMIT 1").get(DEFAULT_ADMIN_USER_ID);
   if (!adminUser) {
     db.prepare(`
-      INSERT INTO users (id, phone, name, phone_verified_at, preferred_role, created_at, updated_at)
-      VALUES (?, ?, 'Smash Admin', ?, 'admin', ?, ?)
-    `).run(DEFAULT_ADMIN_USER_ID, DEFAULT_ADMIN_PHONE, nowIso(), nowIso(), nowIso());
+      INSERT INTO users (id, phone, name, phone_verified_at, preferred_role, referral_code, created_at, updated_at)
+      VALUES (?, ?, 'Smash Admin', ?, 'admin', ?, ?, ?)
+    `).run(
+      DEFAULT_ADMIN_USER_ID,
+      DEFAULT_ADMIN_PHONE,
+      nowIso(),
+      "CHEFADMIN",
+      nowIso(),
+      nowIso(),
+    );
   }
 
   const adminMembership = db.prepare(`
@@ -359,6 +417,12 @@ export const initAppDatabase = (db) => {
       `).run(template.key, template.label, template.body, nowIso());
     }
   });
+
+  const usersWithoutReferralCode = db.prepare("SELECT id, phone, name FROM users WHERE referral_code IS NULL OR referral_code = ''").all();
+  usersWithoutReferralCode.forEach((user) => {
+    db.prepare("UPDATE users SET referral_code = ?, updated_at = ? WHERE id = ?")
+      .run(ensureUniqueReferralCode(db, user.phone || user.name || user.id), nowIso(), user.id);
+  });
 };
 
 const getMembershipRows = (db, userId) => db.prepare(`
@@ -377,6 +441,11 @@ const mapProfile = (db, userRow) => ({
   phoneVerifiedAt: userRow.phone_verified_at || null,
   preferredRole: userRow.preferred_role || "customer",
   loyaltyPointsBalance: Number(userRow.loyalty_points_balance || 0),
+  referralCode: userRow.referral_code || buildReferralCode(userRow.phone || userRow.id),
+  referredByCode: userRow.referred_by_user_id
+    ? db.prepare("SELECT referral_code FROM users WHERE id = ? LIMIT 1").get(userRow.referred_by_user_id)?.referral_code || null
+    : null,
+  referralRewardGrantedAt: userRow.referral_reward_granted_at || null,
   isBlocked: Boolean(userRow.is_blocked),
   memberships: getMembershipRows(db, userRow.id).map((membership) => ({
     id: membership.id,
@@ -478,9 +547,9 @@ export const findOrCreateUserByPhone = (db, phone, name = "") => {
   const id = createId();
   const timestamp = nowIso();
   db.prepare(`
-    INSERT INTO users (id, phone, name, phone_verified_at, preferred_role, created_at, updated_at)
-    VALUES (?, ?, ?, ?, 'customer', ?, ?)
-  `).run(id, phone, name || "", timestamp, timestamp, timestamp);
+    INSERT INTO users (id, phone, name, phone_verified_at, preferred_role, referral_code, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'customer', ?, ?, ?)
+  `).run(id, phone, name || "", timestamp, ensureUniqueReferralCode(db, phone || name || id), timestamp, timestamp);
 
   return db.prepare("SELECT * FROM users WHERE id = ?").get(id);
 };
@@ -515,8 +584,8 @@ export const createAddress = (db, userId, payload) => {
 
   db.prepare(`
     INSERT INTO addresses (
-      id, user_id, label, street, number, complement, neighborhood, city, is_default, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, user_id, label, street, number, complement, neighborhood, city, postal_code, is_default, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     userId,
@@ -526,6 +595,7 @@ export const createAddress = (db, userId, payload) => {
     payload.complement || "",
     payload.neighborhood || "",
     payload.city || "",
+    payload.postalCode || "",
     payload.is_default || isFirst ? 1 : 0,
     nowIso(),
   );
@@ -544,15 +614,64 @@ export const setDefaultAddress = (db, userId, addressId) => {
 export const createOrderRecord = (db, payload) => {
   const orderId = createId();
   const timestamp = nowIso();
-  const restaurant = db.prepare("SELECT loyalty_points_per_real FROM restaurant LIMIT 1").get();
+  const restaurant = db.prepare("SELECT loyalty_points_per_real, loyalty_enabled FROM restaurant LIMIT 1").get();
   const user = db.prepare("SELECT loyalty_points_balance FROM users WHERE id = ? LIMIT 1").get(payload.userId);
-  const requestedRedeem = Math.max(0, Number(payload.loyaltyPointsRedeemed || 0));
+  const subtotal = Math.max(0, Number(payload.subtotal || 0));
+  const deliveryFee = Math.max(0, Number(payload.deliveryFee || 0));
+  const loyaltyEnabled = Number(restaurant?.loyalty_enabled ?? 1) === 1;
+  const requestedCouponCode = String(payload.couponCode || "").trim().toUpperCase();
+  const discountRow = requestedCouponCode
+    ? db.prepare("SELECT * FROM discounts WHERE UPPER(code) = ? LIMIT 1").get(requestedCouponCode)
+    : null;
+  let calculatedDiscount = 0;
+
+  if (requestedCouponCode) {
+    if (!discountRow) {
+      throw new Error("Cupom invalido.");
+    }
+    if (!isDiscountActiveForOrder(discountRow, payload.deliveryMode)) {
+      throw new Error("Esse cupom nao esta disponivel no momento.");
+    }
+    if (subtotal < Number(discountRow.min_order_amount || 0)) {
+      throw new Error("Esse cupom exige um valor minimo de pedido.");
+    }
+
+    const overallUsageCount = db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM orders
+      WHERE coupon_code = ?
+        AND status != 'cancelled'
+    `).get(discountRow.code);
+    if (discountRow.usage_limit != null && Number(overallUsageCount?.total || 0) >= Number(discountRow.usage_limit)) {
+      throw new Error("Esse cupom ja atingiu o limite total de uso.");
+    }
+
+    const customerUsageCount = db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM orders
+      WHERE user_id = ?
+        AND coupon_code = ?
+        AND status != 'cancelled'
+    `).get(payload.userId, discountRow.code);
+    if (discountRow.per_user_limit != null && Number(customerUsageCount?.total || 0) >= Number(discountRow.per_user_limit)) {
+      throw new Error("Voce ja atingiu o limite de uso desse cupom.");
+    }
+
+    calculatedDiscount = calculateDiscountAmount(discountRow, subtotal, deliveryFee, payload.deliveryMode);
+  }
+
+  const requestedRedeem = loyaltyEnabled ? Math.max(0, Number(payload.loyaltyPointsRedeemed || 0)) : 0;
   const availablePoints = Number(user?.loyalty_points_balance || 0);
-  const redeemableCeiling = Math.max(0, Number(payload.subtotal || 0) - Number(payload.discount || 0));
-  const safeRedeem = Math.min(requestedRedeem, availablePoints, redeemableCeiling);
-  const loyaltyDiscount = Math.min(Math.max(0, Number(payload.loyaltyDiscount || safeRedeem)), safeRedeem);
+  const redeemableCeiling = Math.max(0, subtotal - calculatedDiscount);
+  const safeRedeem = loyaltyEnabled ? Math.min(requestedRedeem, availablePoints, redeemableCeiling) : 0;
+  const loyaltyDiscount = loyaltyEnabled
+    ? Math.min(Math.max(0, Number(payload.loyaltyDiscount || safeRedeem)), safeRedeem)
+    : 0;
   const pointsPerReal = Math.max(0, Number(restaurant?.loyalty_points_per_real || 0));
-  const loyaltyPointsEarned = Number(Math.max(0, ((payload.subtotal || 0) - (payload.discount || 0) - loyaltyDiscount) * pointsPerReal).toFixed(2));
+  const loyaltyPointsEarned = loyaltyEnabled
+    ? Number(Math.max(0, (subtotal - calculatedDiscount - loyaltyDiscount) * pointsPerReal).toFixed(2))
+    : 0;
+  const total = Number(Math.max(0, subtotal - calculatedDiscount - loyaltyDiscount + deliveryFee).toFixed(2));
 
   if (requestedRedeem > availablePoints) {
     throw new Error("Pontos insuficientes para esse pedido.");
@@ -576,11 +695,11 @@ export const createOrderRecord = (db, payload) => {
     payload.addressFull || null,
     payload.customerName || "",
     payload.customerPhone || "",
-    payload.couponCode || null,
-    payload.subtotal || 0,
-    payload.discount || 0,
-    payload.deliveryFee || 0,
-    payload.total || 0,
+    discountRow?.code || null,
+    subtotal,
+    calculatedDiscount,
+    deliveryFee,
+    total,
     safeRedeem,
     loyaltyDiscount,
     loyaltyPointsEarned,
@@ -892,6 +1011,33 @@ export const updateDriverProfileRecord = (db, driverId, patch) => {
   );
 };
 
+const ensureDriverMembership = (db, userId) => {
+  const existing = db.prepare(`
+    SELECT *
+    FROM memberships
+    WHERE restaurant_id = ?
+      AND user_id = ?
+      AND role = 'driver'
+    LIMIT 1
+  `).get(DEFAULT_RESTAURANT_ID, userId);
+
+  if (existing) {
+    db.prepare(`
+      UPDATE memberships
+      SET is_active = 1, updated_at = ?
+      WHERE id = ?
+    `).run(nowIso(), existing.id);
+    return existing.id;
+  }
+
+  const id = createId();
+  db.prepare(`
+    INSERT INTO memberships (id, restaurant_id, user_id, role, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, 'driver', 1, ?, ?)
+  `).run(id, DEFAULT_RESTAURANT_ID, userId, nowIso(), nowIso());
+  return id;
+};
+
 export const mapDriverProfile = (row) => row ? ({
   id: row.id,
   restaurantId: row.restaurant_id,
@@ -907,15 +1053,93 @@ export const mapDriverProfile = (row) => row ? ({
 }) : null;
 
 export const listDriverProfiles = (db) => db.prepare(`
-  SELECT *
-  FROM driver_profiles
-  WHERE restaurant_id = ?
+  SELECT DISTINCT d.*
+  FROM driver_profiles d
+  JOIN memberships m
+    ON m.user_id = d.user_id
+   AND m.restaurant_id = d.restaurant_id
+   AND m.role = 'driver'
+   AND m.is_active = 1
+  WHERE d.restaurant_id = ?
   ORDER BY created_at DESC
 `).all(DEFAULT_RESTAURANT_ID).map(mapDriverProfile);
 
 export const getDriverProfileByUser = (db, userId) => {
-  const row = db.prepare("SELECT * FROM driver_profiles WHERE user_id = ? LIMIT 1").get(userId);
+  const row = db.prepare(`
+    SELECT d.*
+    FROM driver_profiles d
+    JOIN memberships m
+      ON m.user_id = d.user_id
+     AND m.restaurant_id = d.restaurant_id
+     AND m.role = 'driver'
+     AND m.is_active = 1
+    WHERE d.user_id = ?
+    LIMIT 1
+  `).get(userId);
   return mapDriverProfile(row);
+};
+
+export const createDriverProfileForAdmin = (db, payload) => {
+  const normalizedPhone = String(payload?.phone || "").replace(/\D/g, "");
+  if (!normalizedPhone) {
+    throw new Error("Informe o telefone do entregador.");
+  }
+
+  const user = db.prepare("SELECT * FROM users WHERE phone = ? LIMIT 1").get(normalizedPhone);
+  if (!user) {
+    throw new Error("O telefone informado ainda nao pertence a nenhum usuario.");
+  }
+
+  ensureDriverMembership(db, user.id);
+  const row = upsertDriverProfileRecord(db, user.id, {
+    displayName: String(payload?.displayName || user.name || "Entregador").trim(),
+    phone: user.phone || normalizedPhone,
+    vehicleLabel: String(payload?.vehicleLabel || "").trim(),
+    vehiclePlate: String(payload?.vehiclePlate || "").trim(),
+  });
+  return mapDriverProfile(row);
+};
+
+export const updateDriverProfileForAdmin = (db, driverId, payload) => {
+  const existing = db.prepare("SELECT * FROM driver_profiles WHERE id = ? LIMIT 1").get(driverId);
+  if (!existing) {
+    throw new Error("Entregador nao encontrado.");
+  }
+
+  ensureDriverMembership(db, existing.user_id);
+  updateDriverProfileRecord(db, driverId, {
+    displayName: String(payload?.displayName || existing.display_name || "Entregador").trim(),
+    vehicleLabel: String(payload?.vehicleLabel || "").trim(),
+    vehiclePlate: String(payload?.vehiclePlate || "").trim(),
+    isOnline: payload?.isOnline,
+    isAvailable: payload?.isAvailable,
+  });
+
+  return mapDriverProfile(db.prepare("SELECT * FROM driver_profiles WHERE id = ? LIMIT 1").get(driverId));
+};
+
+export const deleteDriverProfileRecord = (db, driverId) => {
+  const existing = db.prepare("SELECT * FROM driver_profiles WHERE id = ? LIMIT 1").get(driverId);
+  if (!existing) {
+    throw new Error("Entregador nao encontrado.");
+  }
+
+  db.prepare("DELETE FROM driver_locations WHERE driver_id = ?").run(driverId);
+  db.prepare("UPDATE orders SET assigned_driver_id = NULL WHERE assigned_driver_id = ?").run(driverId);
+  db.prepare("DELETE FROM driver_profiles WHERE id = ?").run(driverId);
+  db.prepare(`
+    UPDATE memberships
+    SET is_active = 0, updated_at = ?
+    WHERE restaurant_id = ?
+      AND user_id = ?
+      AND role = 'driver'
+  `).run(nowIso(), DEFAULT_RESTAURANT_ID, existing.user_id);
+  db.prepare(`
+    UPDATE users
+    SET preferred_role = CASE WHEN preferred_role = 'driver' THEN 'customer' ELSE preferred_role END,
+        updated_at = ?
+    WHERE id = ?
+  `).run(nowIso(), existing.user_id);
 };
 
 export const listOrdersForDriver = (db, driverId) => db.prepare(`
@@ -1260,6 +1484,33 @@ export const buildAdminDashboardOverview = (db, restaurantId = DEFAULT_RESTAURAN
     salesTimeline: timeline,
     topProducts: Array.from(topProductsMap.values()),
     alerts,
+  };
+};
+
+export const buildReferralMetrics = (db, restaurantId = DEFAULT_RESTAURANT_ID) => {
+  const restaurant = db.prepare("SELECT referral_enabled, referral_reward_amount FROM restaurant WHERE id = ? LIMIT 1").get(restaurantId);
+  const referralUsers = db.prepare(`
+    SELECT id, referred_by_user_id
+    FROM users
+    WHERE referred_by_user_id IS NOT NULL
+  `).all();
+  const convertedCustomers = db.prepare(`
+    SELECT COUNT(DISTINCT u.id) AS total
+    FROM users u
+    JOIN orders o ON o.user_id = u.id
+    WHERE u.referred_by_user_id IS NOT NULL
+      AND o.restaurant_id = ?
+      AND o.status = 'delivered'
+  `).get(restaurantId);
+
+  const convertedCount = Number(convertedCustomers?.total || 0);
+  const rewardValue = Number(restaurant?.referral_reward_amount || 0);
+
+  return {
+    totalInvites: referralUsers.length,
+    convertedCustomers: convertedCount,
+    rewardsGranted: convertedCount,
+    rewardValueTotal: Number((convertedCount * rewardValue).toFixed(2)),
   };
 };
 
